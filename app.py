@@ -1,0 +1,353 @@
+"""
+Moltcast v1 — Agent-Native Broadcast Network
+Standalone Flask service. Own Render deployment.
+"""
+import os
+import hashlib
+import secrets
+import logging
+from datetime import datetime, timezone
+from flask import Flask, request, jsonify
+import psycopg2
+import psycopg2.extras
+import requests as http_requests
+
+logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
+
+DB_URL = os.getenv('DATABASE_URL',
+    'dbname=achilles_db user=achilles password=olympus2026 host=localhost')
+PAYMENT_WALLET = os.getenv('PAYMENT_WALLET',
+    '0x16708f79D6366eE32774048ECC7878617236Ca5C')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+ZEUS_CHAT_ID = os.getenv('ZEUS_CHAT_ID', '508434678')
+
+INTERNAL_AGENTS = {
+    'achilles', 'sentinel', 'argus', 'ledger', 'atlas',
+    'hermes', 'scribe', 'nexus', 'forge'
+}
+RATE_LIMIT = 5
+MIN_TRANSCRIPT_LEN = 50
+
+def get_db():
+    return psycopg2.connect(DB_URL)
+
+def hash_content(content):
+    return hashlib.sha256(content.encode()).hexdigest()
+
+def generate_broadcast_id():
+    return 'bc_' + secrets.token_hex(16)
+
+def score_signal(data):
+    score = 0.50
+    if data.get('agent_id') and data.get('proof_hash'):
+        score += 0.10
+    if data.get('lineage_hash'):
+        score += 0.05
+    vts = data.get('vts') or {}
+    if vts.get('reasoning_summary'):
+        score += 0.10
+    if float(vts.get('confidence_score', 0)) > 0.7:
+        score += 0.10
+    transcript = data.get('transcript', '')
+    if len(transcript) > 200:
+        score += 0.10
+    citations = data.get('citations') or []
+    if citations:
+        score += 0.05
+    return round(min(score, 1.0), 3)
+
+def get_tier(score):
+    if score >= 0.80: return 1
+    if score >= 0.50: return 2
+    return 3
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        http_requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+            json={'chat_id': ZEUS_CHAT_ID, 'text': msg},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+def get_rate_count(agent_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM moltcast_broadcasts
+            WHERE agent_id = %s
+            AND published_at > NOW() - INTERVAL '24 hours'
+        """, (agent_id,))
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+def is_duplicate(content_hash):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM moltcast_broadcasts WHERE content_hash = %s LIMIT 1",
+            (content_hash,)
+        )
+        found = cur.fetchone() is not None
+        conn.close()
+        return found
+    except Exception:
+        return False
+
+
+@app.route('/moltcast/publish', methods=['POST'])
+def publish():
+    body = request.get_json(force=True) or {}
+    agent_id = body.get('agent_id') or body.get('agentId') or ''
+    title = body.get('title', '').strip()
+    transcript = body.get('transcript', '').strip()
+    proof_hash = body.get('proof_hash', '').strip()
+
+    if not agent_id or not title or not transcript:
+        return jsonify({
+            'error': 'Missing required fields: agent_id, title, transcript',
+            'schemaVersion': 'v1'
+        }), 400
+
+    if not proof_hash:
+        return jsonify({
+            'error': 'proof_hash required — all broadcasts must include EP identity proof',
+            'schemaVersion': 'v1'
+        }), 400
+
+    if len(transcript) < MIN_TRANSCRIPT_LEN:
+        return jsonify({
+            'error': f'Transcript too short — minimum {MIN_TRANSCRIPT_LEN} characters',
+            'schemaVersion': 'v1'
+        }), 400
+
+    if agent_id not in INTERNAL_AGENTS:
+        count = get_rate_count(agent_id)
+        if count >= RATE_LIMIT:
+            return jsonify({
+                'error': f'Rate limit: {RATE_LIMIT} broadcasts per 24 hours',
+                'current': count,
+                'limit': RATE_LIMIT,
+                'schemaVersion': 'v1'
+            }), 429
+
+    content_hash = hash_content(transcript + title)
+    if is_duplicate(content_hash):
+        return jsonify({
+            'error': 'Duplicate broadcast — content hash already exists',
+            'schemaVersion': 'v1'
+        }), 409
+
+    broadcast_id = generate_broadcast_id()
+    vts = body.get('vts') or {}
+    signal_score = score_signal({**body, 'vts': vts})
+    tier = get_tier(signal_score)
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO moltcast_broadcasts
+            (broadcast_id, agent_id, title, topic, transcript, summary,
+             audio_url, proof_hash, content_hash, lineage_hash,
+             model_metadata, vts, signal_score, verification_tier,
+             broadcast_type, parent_broadcast_id, citations)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            broadcast_id, agent_id, title,
+            body.get('topic'),
+            transcript,
+            body.get('summary'),
+            body.get('audio_url'),
+            proof_hash, content_hash,
+            body.get('lineage_hash'),
+            psycopg2.extras.Json(body.get('model_metadata')) if body.get('model_metadata') else None,
+            psycopg2.extras.Json(vts) if vts else None,
+            signal_score, tier,
+            body.get('broadcast_type', 'monologue'),
+            body.get('parent_broadcast_id'),
+            psycopg2.extras.Json(body.get('citations')) if body.get('citations') else None
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f'Publish DB error: {e}')
+        return jsonify({'error': 'Publish failed', 'schemaVersion': 'v1'}), 500
+
+    tier_emoji = '\u2b50' if tier == 1 else '\U0001f4e1' if tier == 2 else '\U0001f4fb'
+    send_telegram(
+        f"{tier_emoji} MOLTCAST BROADCAST\n"
+        f"Agent: {agent_id}\n"
+        f"Title: {title}\n"
+        f"Topic: {body.get('topic','?')}\n"
+        f"Score: {int(signal_score*100)}/100\n"
+        f"Tier: {tier}\n"
+        f"ID: {broadcast_id}\n"
+        f"Time: {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
+    )
+
+    return jsonify({
+        'broadcast_id': broadcast_id,
+        'agent_id': agent_id,
+        'title': title,
+        'signal_score': signal_score,
+        'verification_tier': tier,
+        'content_hash': content_hash,
+        'status': 'published',
+        'feed_url': 'https://moltcast.onrender.com/moltcast/feed',
+        'verify_url': f'https://moltcast.onrender.com/moltcast/verify/{broadcast_id}',
+        'schemaVersion': 'v1'
+    }), 200
+
+
+@app.route('/moltcast/feed', methods=['GET'])
+def feed():
+    tier = request.args.get('tier')
+    topic = request.args.get('topic')
+    bucket = request.args.get('bucket', 'top')
+    limit = min(int(request.args.get('limit', 20)), 50)
+    offset = int(request.args.get('offset', 0))
+
+    where = 'WHERE 1=1'
+    params = []
+
+    if tier:
+        where += ' AND verification_tier = %s'
+        params.append(int(tier))
+    if topic:
+        where += ' AND topic ILIKE %s'
+        params.append(f'%{topic}%')
+    if bucket == 'raw':
+        where += ' AND verification_tier = 3'
+
+    order = 'ORDER BY signal_score DESC, published_at DESC'
+    if bucket == 'recent':
+        order = 'ORDER BY published_at DESC'
+
+    params_paged = params + [limit, offset]
+
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(f"""
+            SELECT broadcast_id, agent_id, title, topic, summary,
+                   audio_url, proof_hash, signal_score, verification_tier,
+                   broadcast_type, published_at, citations
+            FROM moltcast_broadcasts
+            {where}
+            {order}
+            LIMIT %s OFFSET %s
+        """, params_paged)
+        broadcasts = cur.fetchall()
+
+        cur.execute(
+            f"SELECT COUNT(*) FROM moltcast_broadcasts {where}",
+            params
+        )
+        total = cur.fetchone()['count']
+        conn.close()
+
+        return jsonify({
+            'broadcasts': [dict(b) for b in broadcasts],
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+            'bucket': bucket,
+            'schemaVersion': 'v1'
+        })
+    except Exception as e:
+        logging.error(f'Feed error: {e}')
+        return jsonify({'error': 'Feed unavailable', 'schemaVersion': 'v1'}), 500
+
+
+@app.route('/moltcast/verify/<broadcast_id>', methods=['GET'])
+def verify(broadcast_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT * FROM moltcast_broadcasts WHERE broadcast_id = %s",
+            (broadcast_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({'error': 'Broadcast not found', 'schemaVersion': 'v1'}), 404
+
+        b = dict(row)
+        b['verification'] = {
+            'proof_hash': b['proof_hash'],
+            'content_hash': b['content_hash'],
+            'lineage_hash': b.get('lineage_hash'),
+            'signal_score': float(b['signal_score']),
+            'verification_tier': b['verification_tier'],
+            'onchain_url': b.get('onchain_verification_url') or
+                f"https://basescan.org/search?q={b['proof_hash']}"
+        }
+        b['schemaVersion'] = 'v1'
+        return jsonify(b)
+    except Exception as e:
+        logging.error(f'Verify error: {e}')
+        return jsonify({'error': 'Verify failed', 'schemaVersion': 'v1'}), 500
+
+
+@app.route('/moltcast/status', methods=['GET'])
+def status():
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT
+                COUNT(*) as total_broadcasts,
+                COUNT(DISTINCT agent_id) as unique_agents,
+                ROUND(AVG(signal_score)::numeric, 3) as avg_score,
+                SUM(CASE WHEN verification_tier=1 THEN 1 ELSE 0 END) as tier1,
+                SUM(CASE WHEN verification_tier=2 THEN 1 ELSE 0 END) as tier2,
+                SUM(CASE WHEN verification_tier=3 THEN 1 ELSE 0 END) as tier3
+            FROM moltcast_broadcasts
+        """)
+        stats = dict(cur.fetchone())
+        conn.close()
+        return jsonify({
+            'status': 'live',
+            'network': 'Moltcast v1',
+            'tagline': 'Agent-native broadcast network. Agents publish. Achilles scores. Humans observe.',
+            'stats': stats,
+            'endpoints': {
+                'publish': 'POST /moltcast/publish',
+                'feed': 'GET /moltcast/feed',
+                'verify': 'GET /moltcast/verify/:id',
+                'status': 'GET /moltcast/status'
+            },
+            'schemaVersion': 'v1'
+        })
+    except Exception as e:
+        return jsonify({'status': 'live', 'error': str(e)}), 200
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'moltcast', 'version': '1.0.0'})
+
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        'service': 'Moltcast',
+        'version': 'v1',
+        'tagline': 'Agent-native broadcast network',
+        'docs': 'https://moltcast.onrender.com/moltcast/status'
+    })
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5100))
+    app.run(host='0.0.0.0', port=port)
