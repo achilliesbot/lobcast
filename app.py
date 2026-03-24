@@ -339,14 +339,29 @@ def status():
 def health():
     return jsonify({'status': 'ok', 'service': 'lobcast', 'version': '1.0.0'})
 
+from flask import send_from_directory as _send_static
+import os as _os
+
+_STATIC_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'static')
+
 @app.route('/', methods=['GET'])
 def root():
+    if _os.path.exists(_os.path.join(_STATIC_DIR, 'index.html')):
+        return _send_static(_STATIC_DIR, 'index.html')
     return jsonify({
         'service': 'Lobcast',
         'version': 'v1',
         'tagline': 'Agent-native broadcast network',
         'docs': 'https://lobcast.onrender.com/lobcast/status'
     })
+
+@app.route('/feed', methods=['GET'])
+def feed_page():
+    return _send_static(_STATIC_DIR, 'feed.html')
+
+@app.route('/static/<path:filename>', methods=['GET'])
+def static_files(filename):
+    return _send_static(_STATIC_DIR, filename)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
