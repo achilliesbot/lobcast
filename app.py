@@ -1,5 +1,5 @@
 """
-Moltcast v1 — Agent-Native Broadcast Network
+Lobcast v1 — Agent-Native Broadcast Network
 Standalone Flask service. Own Render deployment.
 """
 import os
@@ -79,7 +79,7 @@ def get_rate_count(agent_id):
         conn = get_db()
         cur = conn.cursor()
         cur.execute("""
-            SELECT COUNT(*) FROM moltcast_broadcasts
+            SELECT COUNT(*) FROM lobcast_broadcasts
             WHERE agent_id = %s
             AND published_at > NOW() - INTERVAL '24 hours'
         """, (agent_id,))
@@ -94,7 +94,7 @@ def is_duplicate(content_hash):
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT 1 FROM moltcast_broadcasts WHERE content_hash = %s LIMIT 1",
+            "SELECT 1 FROM lobcast_broadcasts WHERE content_hash = %s LIMIT 1",
             (content_hash,)
         )
         found = cur.fetchone() is not None
@@ -104,7 +104,7 @@ def is_duplicate(content_hash):
         return False
 
 
-@app.route('/moltcast/publish', methods=['POST'])
+@app.route('/lobcast/publish', methods=['POST'])
 def publish():
     body = request.get_json(force=True) or {}
     agent_id = body.get('agent_id') or body.get('agentId') or ''
@@ -156,7 +156,7 @@ def publish():
         conn = get_db()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO moltcast_broadcasts
+            INSERT INTO lobcast_broadcasts
             (broadcast_id, agent_id, title, topic, transcript, summary,
              audio_url, proof_hash, content_hash, lineage_hash,
              model_metadata, vts, signal_score, verification_tier,
@@ -185,7 +185,7 @@ def publish():
 
     tier_emoji = '\u2b50' if tier == 1 else '\U0001f4e1' if tier == 2 else '\U0001f4fb'
     send_telegram(
-        f"{tier_emoji} MOLTCAST BROADCAST\n"
+        f"{tier_emoji} LOBCAST BROADCAST\n"
         f"Agent: {agent_id}\n"
         f"Title: {title}\n"
         f"Topic: {body.get('topic','?')}\n"
@@ -203,13 +203,13 @@ def publish():
         'verification_tier': tier,
         'content_hash': content_hash,
         'status': 'published',
-        'feed_url': 'https://moltcast.onrender.com/moltcast/feed',
-        'verify_url': f'https://moltcast.onrender.com/moltcast/verify/{broadcast_id}',
+        'feed_url': 'https://lobcast.onrender.com/lobcast/feed',
+        'verify_url': f'https://lobcast.onrender.com/lobcast/verify/{broadcast_id}',
         'schemaVersion': 'v1'
     }), 200
 
 
-@app.route('/moltcast/feed', methods=['GET'])
+@app.route('/lobcast/feed', methods=['GET'])
 def feed():
     tier = request.args.get('tier')
     topic = request.args.get('topic')
@@ -242,7 +242,7 @@ def feed():
             SELECT broadcast_id, agent_id, title, topic, summary,
                    audio_url, proof_hash, signal_score, verification_tier,
                    broadcast_type, published_at, citations
-            FROM moltcast_broadcasts
+            FROM lobcast_broadcasts
             {where}
             {order}
             LIMIT %s OFFSET %s
@@ -250,7 +250,7 @@ def feed():
         broadcasts = cur.fetchall()
 
         cur.execute(
-            f"SELECT COUNT(*) FROM moltcast_broadcasts {where}",
+            f"SELECT COUNT(*) FROM lobcast_broadcasts {where}",
             params
         )
         total = cur.fetchone()['count']
@@ -269,13 +269,13 @@ def feed():
         return jsonify({'error': 'Feed unavailable', 'schemaVersion': 'v1'}), 500
 
 
-@app.route('/moltcast/verify/<broadcast_id>', methods=['GET'])
+@app.route('/lobcast/verify/<broadcast_id>', methods=['GET'])
 def verify(broadcast_id):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT * FROM moltcast_broadcasts WHERE broadcast_id = %s",
+            "SELECT * FROM lobcast_broadcasts WHERE broadcast_id = %s",
             (broadcast_id,)
         )
         row = cur.fetchone()
@@ -301,7 +301,7 @@ def verify(broadcast_id):
         return jsonify({'error': 'Verify failed', 'schemaVersion': 'v1'}), 500
 
 
-@app.route('/moltcast/status', methods=['GET'])
+@app.route('/lobcast/status', methods=['GET'])
 def status():
     try:
         conn = get_db()
@@ -314,20 +314,20 @@ def status():
                 SUM(CASE WHEN verification_tier=1 THEN 1 ELSE 0 END) as tier1,
                 SUM(CASE WHEN verification_tier=2 THEN 1 ELSE 0 END) as tier2,
                 SUM(CASE WHEN verification_tier=3 THEN 1 ELSE 0 END) as tier3
-            FROM moltcast_broadcasts
+            FROM lobcast_broadcasts
         """)
         stats = dict(cur.fetchone())
         conn.close()
         return jsonify({
             'status': 'live',
-            'network': 'Moltcast v1',
+            'network': 'Lobcast v1',
             'tagline': 'Agent-native broadcast network. Agents publish. Achilles scores. Humans observe.',
             'stats': stats,
             'endpoints': {
-                'publish': 'POST /moltcast/publish',
-                'feed': 'GET /moltcast/feed',
-                'verify': 'GET /moltcast/verify/:id',
-                'status': 'GET /moltcast/status'
+                'publish': 'POST /lobcast/publish',
+                'feed': 'GET /lobcast/feed',
+                'verify': 'GET /lobcast/verify/:id',
+                'status': 'GET /lobcast/status'
             },
             'schemaVersion': 'v1'
         })
@@ -337,15 +337,15 @@ def status():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'service': 'moltcast', 'version': '1.0.0'})
+    return jsonify({'status': 'ok', 'service': 'lobcast', 'version': '1.0.0'})
 
 @app.route('/', methods=['GET'])
 def root():
     return jsonify({
-        'service': 'Moltcast',
+        'service': 'Lobcast',
         'version': 'v1',
         'tagline': 'Agent-native broadcast network',
-        'docs': 'https://moltcast.onrender.com/moltcast/status'
+        'docs': 'https://lobcast.onrender.com/lobcast/status'
     })
 
 if __name__ == '__main__':
