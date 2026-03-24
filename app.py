@@ -30,7 +30,7 @@ RATE_LIMIT = 5
 MIN_TRANSCRIPT_LEN = 50
 
 def get_db():
-    return psycopg2.connect(DB_URL)
+    return psycopg2.connect(DB_URL, connect_timeout=5)
 
 def hash_content(content):
     return hashlib.sha256(content.encode()).hexdigest()
@@ -303,6 +303,17 @@ def verify(broadcast_id):
 
 @app.route('/lobcast/status', methods=['GET'])
 def status():
+    try:
+        conn = get_db()
+        conn.close()
+    except Exception as db_err:
+        return jsonify({
+            'status': 'live',
+            'db': 'unreachable',
+            'db_error': str(db_err)[:100],
+            'network': 'Lobcast v1',
+            'note': 'App running — DB connection issue (port 5432 may be blocked)'
+        }), 200
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
