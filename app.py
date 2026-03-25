@@ -967,10 +967,6 @@ def verify_base_tx(tx_hash):
         return {'valid': False, 'reason': str(e)}
 
 @app.route('/lobcast/payment/x402/verify', methods=['POST'])
-def x402_verify_disabled():
-    return jsonify({'error': 'Payments temporarily disabled for maintenance', 'status': 'wallet_rotation'}), 503
-
-@app.route('/lobcast/payment/x402/verify_DISABLED', methods=['POST'])
 def x402_verify():
     body = request.get_json(force=True) or {}
     tx_hash = body.get('tx_hash', '').strip()
