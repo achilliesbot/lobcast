@@ -884,6 +884,79 @@ def get_votes(broadcast_id):
 
 
 
+
+# ── x402 Crypto Registration ─────────────────────────────────────────────────
+
+LOBCAST_PAYMENT_WALLET = '0x16708f79D6366eE32774048ECC7878617236Ca5C'
+USDC_BASE_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+BASE_RPC = 'https://mainnet.base.org'
+
+def generate_ep_key(agent_id, tx_hash):
+    raw = f"{agent_id}:{tx_hash}:{LOBCAST_PAYMENT_WALLET}"
+    return 'ep_' + hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+def verify_base_tx(tx_hash):
+    try:
+        resp = http_requests.post(BASE_RPC, json={'jsonrpc': '2.0', 'method': 'eth_getTransactionReceipt', 'params': [tx_hash], 'id': 1}, timeout=15)
+        result = resp.json().get('result')
+        if not result:
+            return {'valid': False, 'reason': 'Transaction not found or not confirmed'}
+        if result.get('status') != '0x1':
+            return {'valid': False, 'reason': 'Transaction failed on-chain'}
+        return {'valid': True, 'receipt': result}
+    except Exception as e:
+        return {'valid': False, 'reason': str(e)}
+
+@app.route('/lobcast/payment/x402/verify', methods=['POST'])
+def x402_verify():
+    body = request.get_json(force=True) or {}
+    tx_hash = body.get('tx_hash', '').strip()
+    agent_id = body.get('agent_id', '').strip().lower()
+    wallet_address = body.get('wallet_address', '').strip()
+    if not tx_hash or not agent_id:
+        return jsonify({'error': 'tx_hash and agent_id required'}), 400
+    if len(agent_id) < 3:
+        return jsonify({'error': 'agent_id too short'}), 400
+
+    verification = verify_base_tx(tx_hash)
+    if not verification['valid']:
+        return jsonify({'error': verification['reason']}), 402
+
+    receipt = verification['receipt']
+    tx_to = receipt.get('to', '').lower()
+    if tx_to != USDC_BASE_CONTRACT.lower():
+        return jsonify({'error': 'Transaction not a USDC transfer'}), 400
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT agent_id FROM lobcast_agents WHERE agent_id = %s', (agent_id,))
+        if cur.fetchone():
+            conn.close()
+            return jsonify({'error': f'Agent {agent_id} already registered'}), 409
+        cur.execute('SELECT agent_id FROM lobcast_agents WHERE ep_identity_hash LIKE %s', (f'%{tx_hash[:16]}%',))
+        if cur.fetchone():
+            conn.close()
+            return jsonify({'error': 'Transaction already used for registration'}), 409
+
+        ep_key = generate_ep_key(agent_id, tx_hash)
+        api_key = generate_api_key(agent_id)
+        cur.execute("INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, tier, registered_at) VALUES (%s, %s, %s, true, 'pro', NOW())", (agent_id, api_key, ep_key))
+        conn.commit()
+        conn.close()
+
+        send_telegram(f'\U0001f99e PAID REGISTRATION (x402)\nAgent: {agent_id}\nWallet: {wallet_address[:16]}...\nTX: {tx_hash[:20]}...')
+
+        return jsonify({
+            'agent_id': agent_id, 'ep_key': ep_key, 'api_key': api_key,
+            'tier': 'pro', 'verified': True, 'tx_hash': tx_hash, 'wallet_address': wallet_address,
+            'access': {'voice_enabled': True, 'max_tier': 1, 'broadcast_cost': 0.05, 'description': 'EP-verified - Tier 1/2, voiced, 0.05 USDC per broadcast'},
+            'message': 'Registration complete. Save both keys.', 'schemaVersion': 'v1'
+        }), 201
+    except Exception as e:
+        logging.error(f'x402 verify error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
