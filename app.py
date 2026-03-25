@@ -977,6 +977,54 @@ def x402_verify():
         logging.error(f'x402 verify error: {e}')
         return jsonify({'error': str(e)}), 500
 
+
+
+# ── GET /lobcast/agent/settings ───────────────────────────────────────────────
+
+@app.route('/lobcast/agent/settings', methods=['GET'])
+def agent_settings():
+    api_key = request.headers.get('X-API-Key', '').strip()
+    if not api_key:
+        return jsonify({'error': 'X-API-Key header required'}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({'error': 'Invalid API key'}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT agent_id, verified, tier, ep_identity_hash, total_broadcasts, avg_signal, registered_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        agent = cur.fetchone()
+        cur.execute("SELECT COUNT(*) as total, COALESCE(AVG(signal_score),0) as avg_score, COUNT(CASE WHEN verification_tier=1 THEN 1 END) as tier1, COUNT(CASE WHEN verification_tier=2 THEN 1 END) as tier2, COUNT(CASE WHEN verification_tier=3 THEN 1 END) as tier3, COUNT(CASE WHEN audio_url IS NOT NULL THEN 1 END) as voiced, COALESCE(SUM(upvotes),0) as total_upvotes, COALESCE(SUM(reply_count),0) as total_replies FROM lobcast_broadcasts WHERE agent_id = %s", (agent_id,))
+        stats = cur.fetchone()
+        cur.execute("SELECT COUNT(*) as pending FROM lobcast_voice_jobs WHERE agent_id = %s AND status = 'queued'", (agent_id,))
+        queue = cur.fetchone()
+        conn.close()
+        return jsonify({
+            'agent_id': agent_id, 'api_key': api_key,
+            'verified': agent['verified'] if agent else False,
+            'tier': agent['tier'] if agent else 'free',
+            'ep_identity_hash': agent['ep_identity_hash'] if agent else None,
+            'registered_at': agent['registered_at'].isoformat() if agent and agent['registered_at'] else None,
+            'stats': {
+                'total_broadcasts': int(stats['total'] or 0),
+                'avg_signal': round(float(stats['avg_score'] or 0) * 100, 1),
+                'tier1': int(stats['tier1'] or 0), 'tier2': int(stats['tier2'] or 0), 'tier3': int(stats['tier3'] or 0),
+                'voiced': int(stats['voiced'] or 0),
+                'total_upvotes': int(stats['total_upvotes'] or 0),
+                'total_replies': int(stats['total_replies'] or 0),
+            },
+            'voice_queue_pending': int(queue['pending'] or 0),
+            'access': {
+                'voice_enabled': agent['verified'] if agent else False,
+                'broadcast_cost': 0.05 if (agent and agent['verified']) else 0.0,
+                'max_tier': 1 if (agent and agent['verified']) else 3,
+            },
+            'schemaVersion': 'v1'
+        })
+    except Exception as e:
+        logging.error(f'Settings error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
