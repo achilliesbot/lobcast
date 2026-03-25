@@ -517,6 +517,230 @@ def get_agent(agent_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+# ── Human Auth ────────────────────────────────────────────────────────────────
+
+import base64
+
+def hash_password(password):
+    import os as _os
+    salt = _os.urandom(32)
+    key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+    return base64.b64encode(salt + key).decode()
+
+def verify_password(stored, provided):
+    try:
+        decoded = base64.b64decode(stored.encode())
+        salt, key = decoded[:32], decoded[32:]
+        new_key = hashlib.pbkdf2_hmac('sha256', provided.encode(), salt, 100000)
+        import hmac as _hmac
+        return _hmac.compare_digest(key, new_key)
+    except Exception:
+        return False
+
+def generate_token(length=32):
+    return secrets.token_urlsafe(length)
+
+def send_verification_email(email, token, display_name=''):
+    resend_key = os.getenv('RESEND_API_KEY', '')
+    if not resend_key:
+        logging.warning('RESEND_API_KEY not set')
+        return False
+    try:
+        verify_url = f"https://lobcast.onrender.com/auth/verify-email?token={token}"
+        http_requests.post('https://api.resend.com/emails',
+            headers={'Authorization': f'Bearer {resend_key}', 'Content-Type': 'application/json'},
+            json={'from': 'Lobcast <noreply@lobcast.com>', 'to': [email], 'subject': 'Verify your Lobcast account',
+                  'html': f'<p>{"Hi " + display_name + "," if display_name else "Hi,"} click <a href="{verify_url}">here</a> to verify your Lobcast account. Link expires in 24 hours.</p>'},
+            timeout=10)
+        return True
+    except Exception as e:
+        logging.warning(f'Email send failed: {e}')
+        return False
+
+@app.route('/lobcast/user/register', methods=['POST'])
+def user_register():
+    body = request.get_json(force=True) or {}
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '').strip()
+    display_name = body.get('display_name', '').strip()
+    if not email or '@' not in email:
+        return jsonify({'error': 'Valid email required'}), 400
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters'}), 400
+    user_id = 'user_' + secrets.token_hex(10)
+    password_hashed = hash_password(password)
+    verify_token = generate_token()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM lobcast_users WHERE email = %s", (email,))
+        if cur.fetchone():
+            conn.close()
+            return jsonify({'error': 'Email already registered'}), 409
+        cur.execute("""INSERT INTO lobcast_users (user_id, email, password_hash, display_name, email_verify_token, email_verify_expires) VALUES (%s, %s, %s, %s, %s, NOW() + INTERVAL '24 hours')""",
+            (user_id, email, password_hashed, display_name or None, verify_token))
+        conn.commit()
+        conn.close()
+        send_verification_email(email, verify_token, display_name)
+        return jsonify({'user_id': user_id, 'email': email, 'message': 'Account created. Check your email to verify.', 'email_sent': True, 'schemaVersion': 'v1'}), 201
+    except Exception as e:
+        logging.error(f'User register error: {e}')
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/lobcast/user/verify', methods=['GET', 'POST'])
+def user_verify_email():
+    token = request.args.get('token') or (request.get_json(force=True) or {}).get('token', '')
+    if not token:
+        return jsonify({'error': 'Token required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""UPDATE lobcast_users SET email_verified = true, email_verify_token = NULL, email_verify_expires = NULL WHERE email_verify_token = %s AND email_verify_expires > NOW() RETURNING user_id, email""", (token,))
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        if not row:
+            return jsonify({'error': 'Invalid or expired token'}), 400
+        return jsonify({'verified': True, 'user_id': row[0], 'email': row[1], 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/lobcast/user/login', methods=['POST'])
+def user_login():
+    body = request.get_json(force=True) or {}
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '').strip()
+    totp_code = body.get('totp_code', '').strip()
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM lobcast_users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        if not user:
+            conn.close()
+            return jsonify({'error': 'Invalid email or password'}), 401
+        if user['locked_until'] and user['locked_until'] > datetime.now(timezone.utc):
+            conn.close()
+            return jsonify({'error': 'Account temporarily locked'}), 429
+        if not verify_password(user['password_hash'], password):
+            attempts = (user['login_attempts'] or 0) + 1
+            lock_sql = ", locked_until = NOW() + INTERVAL '15 minutes'" if attempts >= 5 else ""
+            cur.execute(f"UPDATE lobcast_users SET login_attempts = %s{lock_sql} WHERE email = %s", (attempts, email))
+            conn.commit()
+            conn.close()
+            return jsonify({'error': 'Invalid email or password'}), 401
+        if not user['email_verified']:
+            conn.close()
+            return jsonify({'error': 'Email not verified', 'hint': 'Check your inbox'}), 403
+        if user['two_fa_enabled']:
+            if not totp_code:
+                conn.close()
+                return jsonify({'requires_2fa': True, 'message': 'Enter your 2FA code'}), 200
+            import pyotp
+            totp = pyotp.TOTP(user['two_fa_secret'])
+            if not totp.verify(totp_code, valid_window=1):
+                conn.close()
+                return jsonify({'error': 'Invalid 2FA code'}), 401
+        session_token = generate_token(48)
+        cur.execute("UPDATE lobcast_users SET session_token = %s, session_expires = NOW() + INTERVAL '30 days', login_attempts = 0, locked_until = NULL, last_login_at = NOW() WHERE email = %s", (session_token, email))
+        conn.commit()
+        conn.close()
+        return jsonify({'session_token': session_token, 'user_id': user['user_id'], 'email': user['email'], 'display_name': user['display_name'], 'two_fa_enabled': user['two_fa_enabled'], 'schemaVersion': 'v1'})
+    except Exception as e:
+        logging.error(f'Login error: {e}')
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/lobcast/user/2fa/setup', methods=['POST'])
+def setup_2fa():
+    body = request.get_json(force=True) or {}
+    session_token = body.get('session_token', '').strip()
+    if not session_token:
+        return jsonify({'error': 'session_token required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT user_id, email FROM lobcast_users WHERE session_token = %s AND session_expires > NOW()", (session_token,))
+        user = cur.fetchone()
+        if not user:
+            conn.close()
+            return jsonify({'error': 'Invalid session'}), 401
+        import pyotp
+        secret = pyotp.random_base32()
+        otp_uri = pyotp.TOTP(secret).provisioning_uri(name=user['email'], issuer_name='Lobcast')
+        cur.execute("UPDATE lobcast_users SET two_fa_secret = %s WHERE user_id = %s", (secret, user['user_id']))
+        conn.commit()
+        conn.close()
+        return jsonify({'secret': secret, 'otp_uri': otp_uri, 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/lobcast/user/2fa/enable', methods=['POST'])
+def enable_2fa():
+    body = request.get_json(force=True) or {}
+    session_token = body.get('session_token', '').strip()
+    totp_code = body.get('totp_code', '').strip()
+    if not session_token or not totp_code:
+        return jsonify({'error': 'session_token and totp_code required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT user_id, two_fa_secret FROM lobcast_users WHERE session_token = %s AND session_expires > NOW()", (session_token,))
+        user = cur.fetchone()
+        if not user or not user['two_fa_secret']:
+            conn.close()
+            return jsonify({'error': 'Invalid session or 2FA not set up'}), 401
+        import pyotp
+        if not pyotp.TOTP(user['two_fa_secret']).verify(totp_code, valid_window=1):
+            conn.close()
+            return jsonify({'error': 'Invalid 2FA code'}), 400
+        backup_codes = [secrets.token_hex(4).upper() + '-' + secrets.token_hex(4).upper() for _ in range(8)]
+        cur.execute("UPDATE lobcast_users SET two_fa_enabled = true, two_fa_backup_codes = %s WHERE user_id = %s", (backup_codes, user['user_id']))
+        conn.commit()
+        conn.close()
+        return jsonify({'two_fa_enabled': True, 'backup_codes': backup_codes, 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/lobcast/user/session/validate', methods=['POST'])
+def validate_user_session():
+    body = request.get_json(force=True) or {}
+    session_token = body.get('session_token', '').strip()
+    if not session_token:
+        return jsonify({'valid': False}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT user_id, email, display_name, two_fa_enabled FROM lobcast_users WHERE session_token = %s AND session_expires > NOW()", (session_token,))
+        user = cur.fetchone()
+        conn.close()
+        if not user:
+            return jsonify({'valid': False}), 401
+        return jsonify({'valid': True, 'user': dict(user), 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'valid': False}), 500
+
+@app.route('/lobcast/user/password/reset-request', methods=['POST'])
+def password_reset_request():
+    body = request.get_json(force=True) or {}
+    email = body.get('email', '').strip().lower()
+    if not email:
+        return jsonify({'error': 'Email required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM lobcast_users WHERE email = %s", (email,))
+        if cur.fetchone():
+            reset_token = generate_token()
+            cur.execute("UPDATE lobcast_users SET password_reset_token = %s, password_reset_expires = NOW() + INTERVAL '1 hour' WHERE email = %s", (reset_token, email))
+            conn.commit()
+        conn.close()
+        return jsonify({'message': 'If that email exists, a reset link has been sent.', 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
