@@ -13,7 +13,14 @@ import psycopg2.extras
 import requests as http_requests
 
 logging.basicConfig(level=logging.INFO)
+from flask_cors import CORS
 app = Flask(__name__)
+CORS(app, origins=[
+    'https://lobcast-frontend.onrender.com',
+    'https://lobcast.onrender.com',
+    'http://localhost:3000',
+    'http://localhost:5100',
+])
 
 DB_URL = os.getenv('DATABASE_URL',
     'dbname=achilles_db user=achilles password=olympus2026 host=localhost')
