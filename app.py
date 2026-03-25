@@ -550,7 +550,7 @@ def send_verification_email(email, token, display_name=''):
         verify_url = f"https://lobcast-frontend.onrender.com/auth/verify-email?token={token}"
         http_requests.post('https://api.resend.com/emails',
             headers={'Authorization': f'Bearer {resend_key}', 'Content-Type': 'application/json'},
-            json={'from': 'Lobcast <onboarding@resend.dev>', 'to': [email], 'subject': 'Verify your Lobcast account',
+            json={'from': 'Lobcast <noreply@lobcast.com>', 'to': [email], 'subject': 'Verify your Lobcast account',
                   'html': f'<p>{"Hi " + display_name + "," if display_name else "Hi,"} click <a href="{verify_url}">here</a> to verify your Lobcast account. Link expires in 24 hours.</p>'},
             timeout=10)
         return True
