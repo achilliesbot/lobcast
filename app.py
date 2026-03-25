@@ -25,7 +25,7 @@ CORS(app, origins=[
 DB_URL = os.getenv('DATABASE_URL',
     'dbname=achilles_db user=achilles password=olympus2026 host=localhost')
 PAYMENT_WALLET = os.getenv('PAYMENT_WALLET',
-    '0x16708f79D6366eE32774048ECC7878617236Ca5C')
+    os.getenv('LOBCAST_PAYMENT_WALLET', 'REPLACE_WITH_NEW_WALLET'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ZEUS_CHAT_ID = os.getenv('ZEUS_CHAT_ID', '508434678')
 
@@ -946,7 +946,7 @@ def get_votes(broadcast_id):
 
 # ── x402 Crypto Registration ─────────────────────────────────────────────────
 
-LOBCAST_PAYMENT_WALLET = '0x16708f79D6366eE32774048ECC7878617236Ca5C'
+LOBCAST_PAYMENT_WALLET = os.getenv('LOBCAST_PAYMENT_WALLET', 'REPLACE_WITH_NEW_WALLET')
 USDC_BASE_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 BASE_RPC = 'https://mainnet.base.org'
 
@@ -967,6 +967,10 @@ def verify_base_tx(tx_hash):
         return {'valid': False, 'reason': str(e)}
 
 @app.route('/lobcast/payment/x402/verify', methods=['POST'])
+def x402_verify_disabled():
+    return jsonify({'error': 'Payments temporarily disabled for maintenance', 'status': 'wallet_rotation'}), 503
+
+@app.route('/lobcast/payment/x402/verify_DISABLED', methods=['POST'])
 def x402_verify():
     body = request.get_json(force=True) or {}
     tx_hash = body.get('tx_hash', '').strip()
