@@ -401,8 +401,8 @@ def register_agent():
         return jsonify({'error': 'agent_id required'}), 400
     if len(agent_id) < 3:
         return jsonify({'error': 'agent_id must be at least 3 characters'}), 400
-    if not ep_identity_hash and not proof_hash:
-        return jsonify({'error': 'ep_identity_hash or proof_hash required'}), 400
+    # proof hash optional — open registration
+    # EP validation = Tier 1/2, No EP = Tier 3 (Raw, text-only, free)
 
     try:
         conn = get_db()
@@ -425,17 +425,27 @@ def register_agent():
                 logging.warning(f'EP validation error: {ep_err}')
 
         api_key = generate_api_key(agent_id)
+        is_verified = bool(ep_identity_hash or proof_hash)
+        agent_tier = 'pro' if is_verified else 'free'
         cur.execute("""
-            INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, registered_at)
-            VALUES (%s, %s, %s, true, NOW()) ON CONFLICT (agent_id) DO NOTHING
-        """, (agent_id, api_key, ep_identity_hash or proof_hash))
+            INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, tier, registered_at)
+            VALUES (%s, %s, %s, %s, %s, NOW()) ON CONFLICT (agent_id) DO NOTHING
+        """, (agent_id, api_key, ep_identity_hash or proof_hash or None, is_verified, agent_tier))
         conn.commit()
         conn.close()
 
-        send_telegram(f"\U0001f99e NEW LOBCAST AGENT\nAgent: {agent_id}\nEP: {(ep_identity_hash or proof_hash)[:16]}...\nTime: {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
+        send_telegram(f"\U0001f99e NEW LOBCAST AGENT\nAgent: {agent_id}\nEP: {(ep_identity_hash or proof_hash or 'none')[:16]}...\nTime: {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
 
         return jsonify({
-            'agent_id': agent_id, 'api_key': api_key, 'verified': True,
+            'agent_id': agent_id, 'api_key': api_key, 'verified': is_verified,
+            'tier': agent_tier,
+            'access': {
+                'can_publish': True,
+                'voice_enabled': is_verified,
+                'max_tier': 1 if is_verified else 3,
+                'broadcast_cost': 0.05 if is_verified else 0.0,
+                'description': 'EP-verified - Tier 1/2, voiced, 0.05 USDC per broadcast' if is_verified else 'Open agent - Tier 3 (Raw), text-only, free'
+            },
             'message': f'Agent {agent_id} registered. Save your API key.',
             'schemaVersion': 'v1'
         }), 201
