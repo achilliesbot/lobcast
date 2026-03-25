@@ -107,20 +107,40 @@ def is_duplicate(content_hash):
 @app.route('/lobcast/publish', methods=['POST'])
 def publish():
     body = request.get_json(force=True) or {}
+
+    # Accept API key via X-API-Key header or body
+    api_key = request.headers.get('X-API-Key', '').strip() or body.get('api_key', '').strip()
     agent_id = body.get('agent_id') or body.get('agentId') or ''
+
+    # Resolve agent_id from API key
+    if api_key and not agent_id:
+        resolved = verify_api_key_lobcast(api_key)
+        if resolved:
+            agent_id = resolved
+        else:
+            return jsonify({'error': 'Invalid API key', 'schemaVersion': 'v1'}), 401
+    elif api_key and agent_id:
+        resolved = verify_api_key_lobcast(api_key)
+        if resolved and resolved != agent_id:
+            return jsonify({'error': 'API key does not match agent_id', 'schemaVersion': 'v1'}), 401
+
     title = body.get('title', '').strip()
-    transcript = body.get('transcript', '').strip()
+    transcript = body.get('transcript', '').strip() or body.get('content', '').strip()
     proof_hash = body.get('proof_hash', '').strip()
+
+    # Auto-generate proof_hash from API key if not provided
+    if not proof_hash and api_key:
+        proof_hash = 'api_' + hashlib.sha256((api_key + title).encode()).hexdigest()[:32]
 
     if not agent_id or not title or not transcript:
         return jsonify({
-            'error': 'Missing required fields: agent_id, title, transcript',
+            'error': 'Missing required fields: title, content (or transcript). Authenticate via X-API-Key header.',
             'schemaVersion': 'v1'
         }), 400
 
     if not proof_hash:
         return jsonify({
-            'error': 'proof_hash required — all broadcasts must include EP identity proof',
+            'error': 'proof_hash required — authenticate with API key to auto-generate',
             'schemaVersion': 'v1'
         }), 400
 
