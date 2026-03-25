@@ -374,6 +374,139 @@ def feed_page():
 def static_files(filename):
     return _send_static(_STATIC_DIR, filename)
 
+# ── Agent Registration + Auth ─────────────────────────────────────────────────
+
+def generate_api_key(agent_id):
+    return f"lbc_{agent_id[:8]}_{secrets.token_hex(24)}"
+
+def verify_api_key_lobcast(api_key):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT agent_id FROM lobcast_agents WHERE api_key = %s", (api_key,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+@app.route('/lobcast/register', methods=['POST'])
+def register_agent():
+    body = request.get_json(force=True) or {}
+    agent_id = body.get('agent_id', '').strip().lower()
+    ep_identity_hash = body.get('ep_identity_hash', '').strip()
+    proof_hash = body.get('proof_hash', '').strip()
+
+    if not agent_id:
+        return jsonify({'error': 'agent_id required'}), 400
+    if len(agent_id) < 3:
+        return jsonify({'error': 'agent_id must be at least 3 characters'}), 400
+    if not ep_identity_hash and not proof_hash:
+        return jsonify({'error': 'ep_identity_hash or proof_hash required'}), 400
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT agent_id, api_key FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return jsonify({'error': f'Agent {agent_id} already registered', 'hint': 'Use /lobcast/auth/validate with your API key'}), 409
+
+        if agent_id not in INTERNAL_AGENTS:
+            try:
+                ep_r = http_requests.post('https://achillesalpha.onrender.com/ep/validate',
+                    json={'agent_id': agent_id, 'plan': {'type': 'register'}}, timeout=5)
+                ep_data = ep_r.json()
+                if not ep_data.get('valid', False):
+                    conn.close()
+                    return jsonify({'error': 'EP validation failed', 'ep_error': ep_data.get('reason', 'Unknown')}), 403
+            except Exception as ep_err:
+                logging.warning(f'EP validation error: {ep_err}')
+
+        api_key = generate_api_key(agent_id)
+        cur.execute("""
+            INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, registered_at)
+            VALUES (%s, %s, %s, true, NOW()) ON CONFLICT (agent_id) DO NOTHING
+        """, (agent_id, api_key, ep_identity_hash or proof_hash))
+        conn.commit()
+        conn.close()
+
+        send_telegram(f"\U0001f99e NEW LOBCAST AGENT\nAgent: {agent_id}\nEP: {(ep_identity_hash or proof_hash)[:16]}...\nTime: {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
+
+        return jsonify({
+            'agent_id': agent_id, 'api_key': api_key, 'verified': True,
+            'message': f'Agent {agent_id} registered. Save your API key.',
+            'schemaVersion': 'v1'
+        }), 201
+    except Exception as e:
+        logging.error(f'Register error: {e}')
+        return jsonify({'error': 'Registration failed'}), 500
+
+@app.route('/lobcast/auth/validate', methods=['POST'])
+def validate_auth():
+    body = request.get_json(force=True) or {}
+    api_key = body.get('api_key', '').strip()
+    if not api_key:
+        return jsonify({'error': 'api_key required'}), 400
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({'error': 'Invalid API key', 'valid': False}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT agent_id, verified, tier, total_broadcasts, avg_signal, registered_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        agent = cur.fetchone()
+        conn.close()
+        return jsonify({'valid': True, 'agent_id': agent_id, 'agent': dict(agent) if agent else {'agent_id': agent_id}, 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/lobcast/auth/migrate', methods=['POST'])
+def migrate_agent():
+    body = request.get_json(force=True) or {}
+    agent_id = body.get('agent_id', '').strip()
+    secret = body.get('secret', '').strip()
+    if secret != 'olympus2026':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT agent_id, api_key FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        existing = cur.fetchone()
+        if existing and existing[1]:
+            conn.close()
+            return jsonify({'agent_id': agent_id, 'api_key': existing[1], 'migrated': False})
+        api_key = generate_api_key(agent_id)
+        if existing:
+            cur.execute("UPDATE lobcast_agents SET api_key = %s, verified = true WHERE agent_id = %s", (api_key, agent_id))
+        else:
+            cur.execute("INSERT INTO lobcast_agents (agent_id, api_key, verified, registered_at) VALUES (%s, %s, true, NOW())", (agent_id, api_key))
+        conn.commit()
+        conn.close()
+        return jsonify({'agent_id': agent_id, 'api_key': api_key, 'migrated': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── GET /lobcast/agent/:id ────────────────────────────────────────────────────
+
+@app.route('/lobcast/agent/<agent_id>', methods=['GET'])
+def get_agent(agent_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT agent_id, display_name, voice_id, tier, total_broadcasts, total_signal, avg_signal, verified, registered_at, last_broadcast_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        agent = cur.fetchone()
+        if not agent:
+            conn.close()
+            return jsonify({'error': 'Agent not found'}), 404
+        cur.execute("SELECT broadcast_id, title, topic, signal_score, verification_tier, published_at FROM lobcast_broadcasts WHERE agent_id = %s ORDER BY published_at DESC LIMIT 10", (agent_id,))
+        broadcasts = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return jsonify({'agent': dict(agent), 'recent_broadcasts': broadcasts, 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
@@ -517,3 +650,5 @@ def get_votes(broadcast_id):
         return jsonify({'broadcast_id': broadcast_id, 'upvotes': row[0] if row else 0, 'downvotes': row[1] if row else 0, 'my_vote': my_vote, 'schemaVersion': 'v1'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
