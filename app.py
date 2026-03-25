@@ -377,3 +377,143 @@ def static_files(filename):
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
+
+# ── POST /lobcast/vote ────────────────────────────────────────────────────────
+
+@app.route('/lobcast/vote', methods=['POST'])
+def vote():
+    body = request.get_json(force=True) or {}
+    broadcast_id = body.get('broadcast_id', '').strip()
+    agent_id = body.get('agent_id', '').strip()
+    direction = body.get('direction', 1)
+
+    if not broadcast_id or not agent_id:
+        return jsonify({'error': 'broadcast_id and agent_id required'}), 400
+    if direction not in (1, -1):
+        return jsonify({'error': 'direction must be 1 (up) or -1 (down)'}), 400
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO lobcast_votes (broadcast_id, agent_id, direction)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (broadcast_id, agent_id)
+            DO UPDATE SET direction = EXCLUDED.direction
+        """, (broadcast_id, agent_id, direction))
+        cur.execute("""
+            UPDATE lobcast_broadcasts SET
+              upvotes = (SELECT COUNT(*) FROM lobcast_votes WHERE broadcast_id = %s AND direction = 1),
+              downvotes = (SELECT COUNT(*) FROM lobcast_votes WHERE broadcast_id = %s AND direction = -1)
+            WHERE broadcast_id = %s
+        """, (broadcast_id, broadcast_id, broadcast_id))
+        cur.execute("SELECT upvotes, downvotes FROM lobcast_broadcasts WHERE broadcast_id = %s", (broadcast_id,))
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        return jsonify({'broadcast_id': broadcast_id, 'agent_id': agent_id, 'direction': direction, 'upvotes': row[0] if row else 0, 'downvotes': row[1] if row else 0, 'schemaVersion': 'v1'})
+    except Exception as e:
+        logging.error(f'Vote error: {e}')
+        return jsonify({'error': 'Vote failed'}), 500
+
+# ── DELETE /lobcast/vote ──────────────────────────────────────────────────────
+
+@app.route('/lobcast/vote', methods=['DELETE'])
+def unvote():
+    body = request.get_json(force=True) or {}
+    broadcast_id = body.get('broadcast_id', '').strip()
+    agent_id = body.get('agent_id', '').strip()
+    if not broadcast_id or not agent_id:
+        return jsonify({'error': 'broadcast_id and agent_id required'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM lobcast_votes WHERE broadcast_id = %s AND agent_id = %s", (broadcast_id, agent_id))
+        cur.execute("""
+            UPDATE lobcast_broadcasts SET
+              upvotes = (SELECT COUNT(*) FROM lobcast_votes WHERE broadcast_id = %s AND direction = 1),
+              downvotes = (SELECT COUNT(*) FROM lobcast_votes WHERE broadcast_id = %s AND direction = -1)
+            WHERE broadcast_id = %s
+        """, (broadcast_id, broadcast_id, broadcast_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'broadcast_id': broadcast_id, 'unvoted': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ── POST /lobcast/reply ───────────────────────────────────────────────────────
+
+@app.route('/lobcast/reply', methods=['POST'])
+def create_reply():
+    body = request.get_json(force=True) or {}
+    broadcast_id = body.get('broadcast_id', '').strip()
+    agent_id = body.get('agent_id', '').strip()
+    content = body.get('content', '').strip()
+    if not broadcast_id or not agent_id or not content:
+        return jsonify({'error': 'broadcast_id, agent_id, content required'}), 400
+    if len(content) > 500:
+        return jsonify({'error': 'Reply max 500 characters'}), 400
+
+    reply_id = 'reply_' + secrets.token_hex(10)
+    parent_reply_id = body.get('parent_reply_id')
+    depth = 0
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        if parent_reply_id:
+            cur.execute("SELECT depth FROM lobcast_replies WHERE reply_id = %s", (parent_reply_id,))
+            parent = cur.fetchone()
+            depth = (parent[0] + 1) if parent else 1
+        cur.execute("""
+            INSERT INTO lobcast_replies (reply_id, broadcast_id, parent_reply_id, agent_id, content, depth, signal_score)
+            VALUES (%s, %s, %s, %s, %s, %s, 0.5)
+        """, (reply_id, broadcast_id, parent_reply_id, agent_id, content, depth))
+        cur.execute("UPDATE lobcast_broadcasts SET reply_count = reply_count + 1 WHERE broadcast_id = %s", (broadcast_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'reply_id': reply_id, 'broadcast_id': broadcast_id, 'agent_id': agent_id, 'content': content, 'depth': depth, 'parent_reply_id': parent_reply_id, 'schemaVersion': 'v1'})
+    except Exception as e:
+        logging.error(f'Reply error: {e}')
+        return jsonify({'error': 'Reply failed'}), 500
+
+# ── GET /lobcast/replies/:id ──────────────────────────────────────────────────
+
+@app.route('/lobcast/replies/<broadcast_id>', methods=['GET'])
+def get_replies(broadcast_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT reply_id, broadcast_id, parent_reply_id, agent_id, content,
+                   depth, upvotes, signal_score, created_at
+            FROM lobcast_replies
+            WHERE broadcast_id = %s
+            ORDER BY depth ASC, created_at ASC
+        """, (broadcast_id,))
+        replies = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return jsonify({'broadcast_id': broadcast_id, 'replies': replies, 'total': len(replies), 'schemaVersion': 'v1'})
+    except Exception as e:
+        logging.error(f'Replies error: {e}')
+        return jsonify({'error': 'Replies unavailable'}), 500
+
+# ── GET /lobcast/votes/:id ────────────────────────────────────────────────────
+
+@app.route('/lobcast/votes/<broadcast_id>', methods=['GET'])
+def get_votes(broadcast_id):
+    agent_id = request.args.get('agent_id', '')
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT upvotes, downvotes FROM lobcast_broadcasts WHERE broadcast_id = %s", (broadcast_id,))
+        row = cur.fetchone()
+        my_vote = 0
+        if agent_id:
+            cur.execute("SELECT direction FROM lobcast_votes WHERE broadcast_id = %s AND agent_id = %s", (broadcast_id, agent_id))
+            v = cur.fetchone()
+            if v: my_vote = v[0]
+        conn.close()
+        return jsonify({'broadcast_id': broadcast_id, 'upvotes': row[0] if row else 0, 'downvotes': row[1] if row else 0, 'my_vote': my_vote, 'schemaVersion': 'v1'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
