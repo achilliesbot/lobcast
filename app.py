@@ -11,6 +11,7 @@ from flask import Flask, request, jsonify
 import psycopg2
 import psycopg2.extras
 import requests as http_requests
+import threading
 
 logging.basicConfig(level=logging.INFO)
 from flask_cors import CORS
@@ -209,6 +210,12 @@ def publish():
     except Exception as e:
         logging.error(f'Publish DB error: {e}')
         return jsonify({'error': 'Publish failed', 'schemaVersion': 'v1'}), 500
+
+    # Auto-trigger TTS for Tier 1/2 broadcasts
+    if tier <= 2:
+        tts_text = f"{title}. {transcript}"
+        enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
+        logging.info(f"TTS enqueued for {broadcast_id}")
 
     tier_emoji = '\u2b50' if tier == 1 else '\U0001f4e1' if tier == 2 else '\U0001f4fb'
     send_telegram(
@@ -1135,6 +1142,189 @@ def mark_notifications_read():
         return jsonify({'marked_read': count, 'schemaVersion': 'v1'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# -- TTS Configuration --------------------------------------------------------
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam voice
+ELEVENLABS_MODEL = "eleven_turbo_v2"  # Flash/Turbo model
+
+
+def generate_tts(text, broadcast_id):
+    """Generate TTS via ElevenLabs Flash model, upload to Supabase Storage."""
+    if not ELEVENLABS_API_KEY:
+        logging.warning("ELEVENLABS_API_KEY not set")
+        return None
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logging.warning("Supabase not configured")
+        return None
+    try:
+        resp = http_requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg"
+            },
+            json={
+                "text": text[:2500],
+                "model_id": ELEVENLABS_MODEL,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                    "style": 0.0,
+                    "use_speaker_boost": True
+                }
+            },
+            timeout=30
+        )
+        if resp.status_code != 200:
+            logging.error(f"ElevenLabs error {resp.status_code}: {resp.text[:200]}")
+            return None
+        audio_bytes = resp.content
+        audio_filename = f"broadcasts/{broadcast_id}.mp3"
+        upload_resp = http_requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/lobcast-audio/{audio_filename}",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "audio/mpeg",
+                "x-upsert": "true"
+            },
+            data=audio_bytes,
+            timeout=30
+        )
+        if upload_resp.status_code not in [200, 201]:
+            logging.error(f"Supabase upload error {upload_resp.status_code}: {upload_resp.text[:200]}")
+            return None
+        audio_url = f"{SUPABASE_URL}/storage/v1/object/public/lobcast-audio/{audio_filename}"
+        logging.info(f"TTS complete for {broadcast_id}: {audio_url}")
+        return audio_url
+    except Exception as e:
+        logging.error(f"TTS error: {e}")
+        return None
+
+
+def process_voice_job(job_id, broadcast_id, text, tier):
+    """Background thread - generate TTS and update broadcast record."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE lobcast_voice_jobs SET status = %s, started_at = NOW() WHERE job_id = %s",
+            ("processing", job_id)
+        )
+        conn.commit()
+        audio_url = generate_tts(text, broadcast_id)
+        if audio_url:
+            cur.execute(
+                "UPDATE lobcast_broadcasts SET audio_url = %s, voice_status = %s WHERE broadcast_id = %s",
+                (audio_url, "voiced", broadcast_id)
+            )
+            cur.execute(
+                "UPDATE lobcast_voice_jobs SET status = %s, audio_url = %s, completed_at = NOW() WHERE job_id = %s",
+                ("complete", audio_url, job_id)
+            )
+            logging.info(f"Voice job {job_id} complete")
+        else:
+            cur.execute(
+                "UPDATE lobcast_voice_jobs SET status = %s, completed_at = NOW() WHERE job_id = %s",
+                ("failed", job_id)
+            )
+            logging.error(f"Voice job {job_id} failed")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"process_voice_job error: {e}")
+
+
+def enqueue_voice_job(broadcast_id, text, tier, agent_id):
+    """Create voice job record and start background thread."""
+    job_id = "vj_" + secrets.token_hex(10)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO lobcast_voice_jobs
+            (job_id, broadcast_id, agent_id, voice_id, model_id,
+             char_count, tier, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+            (job_id, broadcast_id, agent_id, ELEVENLABS_VOICE_ID,
+             ELEVENLABS_MODEL, len(text), tier, "pending")
+        )
+        conn.commit()
+        conn.close()
+        thread = threading.Thread(
+            target=process_voice_job,
+            args=(job_id, broadcast_id, text, tier),
+            daemon=True
+        )
+        thread.start()
+        logging.info(f"Voice job {job_id} enqueued for {broadcast_id}")
+        return job_id
+    except Exception as e:
+        logging.error(f"enqueue_voice_job error: {e}")
+        return None
+
+
+@app.route("/lobcast/broadcast/audio/<broadcast_id>", methods=["GET"])
+def get_broadcast_audio(broadcast_id):
+    """Get audio URL and voice status for a broadcast."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT broadcast_id, audio_url, voice_status FROM lobcast_broadcasts WHERE broadcast_id = %s",
+            (broadcast_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Broadcast not found"}), 404
+        return jsonify({
+            "broadcast_id": broadcast_id,
+            "audio_url": row["audio_url"],
+            "voice_status": row.get("voice_status", "pending"),
+            "has_audio": row["audio_url"] is not None,
+            "schemaVersion": "v1"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/voice/generate", methods=["POST"])
+def trigger_voice_generation():
+    """Manually trigger TTS for a broadcast."""
+    body = request.get_json(force=True) or {}
+    broadcast_id = body.get("broadcast_id", "").strip()
+    secret = body.get("secret", "").strip()
+    if secret != "olympus2026":
+        return jsonify({"error": "Unauthorized"}), 401
+    if not broadcast_id:
+        return jsonify({"error": "broadcast_id required"}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT broadcast_id, title, transcript, verification_tier, agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s",
+            (broadcast_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Broadcast not found"}), 404
+        text = row["title"] + ". " + row["transcript"]
+        job_id = enqueue_voice_job(broadcast_id, text, row["verification_tier"], row["agent_id"])
+        return jsonify({
+            "broadcast_id": broadcast_id,
+            "job_id": job_id,
+            "status": "queued"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
