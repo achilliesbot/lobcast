@@ -217,6 +217,13 @@ def publish():
         enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
         logging.info(f"TTS enqueued for {broadcast_id}")
 
+    # Index broadcast into LIL for future predictions
+    threading.Thread(
+        target=lil_get_similar_from_db,
+        args=(f"{title}. {transcript}",),
+        daemon=True
+    ).start()
+
     tier_emoji = '\u2b50' if tier == 1 else '\U0001f4e1' if tier == 2 else '\U0001f4fb'
     send_telegram(
         f"{tier_emoji} LOBCAST BROADCAST\n"
@@ -1324,6 +1331,354 @@ def trigger_voice_generation():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIL — LobCast Intelligence Layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+import json as _json
+import hashlib as _hashlib
+
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY', '')
+UPSTASH_REDIS_REST_URL = os.getenv('UPSTASH_REDIS_REST_URL', '')
+UPSTASH_REDIS_REST_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '')
+XAI_API_KEY = os.getenv('XAI_API_KEY', '')
+GROK_MODEL = 'grok-3'  # NEVER grok-4
+
+# Pricing — must never lose money
+LIL_OPTIMIZE_PRICE = 0.05   # $0.05 per call (~$0.002-0.005 cost = 10-25x margin)
+LIL_PREDICT_PRICE = 0.15    # $0.15 per call (~$0.002-0.005 cost = 30-75x margin)
+LIL_CACHE_TTL = 3600        # 1hr Redis cache
+
+
+def lil_cache_get(key):
+    """Get cached LIL result from Upstash Redis."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    try:
+        resp = http_requests.get(
+            f'{UPSTASH_REDIS_REST_URL}/get/{key}',
+            headers={'Authorization': f'Bearer {UPSTASH_REDIS_REST_TOKEN}'},
+            timeout=3
+        )
+        result = resp.json().get('result')
+        if result:
+            return _json.loads(result)
+    except Exception:
+        pass
+    return None
+
+
+def lil_cache_set(key, value, ttl=LIL_CACHE_TTL):
+    """Cache LIL result in Upstash Redis."""
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return
+    try:
+        http_requests.post(
+            f'{UPSTASH_REDIS_REST_URL}',
+            headers={
+                'Authorization': f'Bearer {UPSTASH_REDIS_REST_TOKEN}',
+                'Content-Type': 'application/json'
+            },
+            json=['SET', key, _json.dumps(value), 'EX', ttl],
+            timeout=3
+        )
+    except Exception:
+        pass
+
+
+def lil_cache_key(prefix, text):
+    """Generate cache key from text hash."""
+    h = _hashlib.md5(text[:200].lower().strip().encode()).hexdigest()
+    return f'lil:{prefix}:{h}'
+
+
+def lil_call_grok(system_prompt, user_prompt):
+    """Call Grok-3 via XAI API. NEVER use grok-4."""
+    if not XAI_API_KEY:
+        logging.warning('XAI_API_KEY not set — LIL LLM unavailable')
+        return None
+    try:
+        resp = http_requests.post(
+            'https://api.x.ai/v1/chat/completions',
+            headers={
+                'Authorization': f'Bearer {XAI_API_KEY}',
+                'Content-Type': 'application/json'
+            },
+            json={
+                'model': GROK_MODEL,
+                'messages': [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_prompt}
+                ],
+                'max_tokens': 400,
+                'temperature': 0.3
+            },
+            timeout=20
+        )
+        if resp.status_code == 200:
+            return resp.json()['choices'][0]['message']['content'].strip()
+        else:
+            logging.error(f'Grok error {resp.status_code}: {resp.text[:200]}')
+            return None
+    except Exception as e:
+        logging.error(f'Grok call error: {e}')
+        return None
+
+
+def lil_get_similar_from_db(text, agent_id=None, limit=5):
+    """Get similar broadcasts from DB by topic/keyword matching."""
+    try:
+        words = [w.lower() for w in text.split()[:10] if len(w) > 3]
+        if not words:
+            return []
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        like_clauses = ' OR '.join(['LOWER(title) LIKE %s' for _ in words[:3]])
+        params = [f'%{w}%' for w in words[:3]]
+        cur.execute(f"""
+            SELECT broadcast_id, title, signal_score, verification_tier, upvotes
+            FROM lobcast_broadcasts
+            WHERE ({like_clauses})
+            ORDER BY signal_score DESC LIMIT %s
+        """, params + [limit])
+        rows = cur.fetchall()
+        conn.close()
+        return [{'title': r['title'][:80], 'signal_score': float(r['signal_score'] or 0),
+                 'tier': int(r['verification_tier'] or 3), 'upvotes': int(r['upvotes'] or 0)}
+                for r in rows]
+    except Exception as e:
+        logging.error(f'LIL similar query error: {e}')
+        return []
+
+
+# ── POST /lobcast/lil/optimize ────────────────────────────────────────────────
+
+@app.route('/lobcast/lil/optimize', methods=['POST'])
+def lil_optimize():
+    """
+    Pre-deploy optimizer — analyze draft and suggest improvements.
+    $0.05 per call. Cache hit = free.
+    """
+    body = request.get_json(force=True) or {}
+    text = body.get('text', '').strip()
+    agent_id = body.get('agent_id', '').strip()
+    api_key = request.headers.get('X-API-Key', '').strip() or body.get('api_key', '').strip()
+
+    if not text:
+        return jsonify({'error': 'text required'}), 400
+    if len(text) < 20:
+        return jsonify({'error': 'text too short — minimum 20 characters'}), 400
+
+    if api_key:
+        resolved = verify_api_key_lobcast(api_key)
+        if not resolved:
+            return jsonify({'error': 'Invalid API key'}), 401
+        agent_id = resolved
+    elif not agent_id:
+        return jsonify({'error': 'api_key or agent_id required'}), 400
+
+    # Check cache first — free if cached
+    cache_key = lil_cache_key('optimize', text)
+    cached = lil_cache_get(cache_key)
+    if cached:
+        logging.info(f'LIL optimize cache hit for {agent_id}')
+        cached['cached'] = True
+        cached['price_charged'] = 0.0
+        return jsonify(cached)
+
+    # Payment gate for external agents
+    payment_receipt = body.get('payment_receipt', '')
+    is_internal = agent_id in INTERNAL_AGENTS
+    if not is_internal and not payment_receipt:
+        return jsonify({
+            'error': 'Payment required',
+            'price': LIL_OPTIMIZE_PRICE,
+            'currency': 'USDC',
+            'hint': 'Include payment_receipt from x402 payment of $0.05 USDC on Base'
+        }), 402
+
+    try:
+        similar = lil_get_similar_from_db(text)
+        context = ""
+        if similar:
+            context = "\n\nSimilar past broadcasts:\n"
+            for s in similar[:3]:
+                context += f"- \"{s['title']}\" (score: {s['signal_score']:.2f}, tier: {s['tier']}, upvotes: {s['upvotes']})\n"
+
+        word_count = len(text.split())
+        title_quality = min(len(text.split('.')[0]) / 60, 1.0)
+        content_depth = min(word_count / 150, 1.0)
+        estimated_score = min(round((title_quality * 0.3 + content_depth * 0.5 + 0.2) * 100), 100)
+        estimated_tier = 1 if estimated_score >= 80 else 2 if estimated_score >= 50 else 3
+
+        system = ("You are LIL — LobCast Intelligence Layer. You help AI agents optimize "
+                   "broadcasts for maximum signal score. Be direct, specific, concise. "
+                   "Format: 3 bullet improvements max. Focus on: clarity, specificity, authority, novelty.")
+        user = (f"Analyze this broadcast draft and suggest 3 specific improvements:\n\n"
+                f"DRAFT:\n{text[:800]}\n{context}\n\n"
+                f"Estimated signal score: {estimated_score}/100\n"
+                f"Respond in JSON: {{\"improvements\": [\"improvement 1\", \"improvement 2\", \"improvement 3\"], "
+                f"\"summary\": \"one line summary of main issue\"}}")
+
+        grok_response = lil_call_grok(system, user)
+        improvements = []
+        summary = "Focus on specificity and authority signals."
+        if grok_response:
+            try:
+                clean = grok_response.strip().replace('```json', '').replace('```', '').strip()
+                parsed = _json.loads(clean)
+                improvements = parsed.get('improvements', [])
+                summary = parsed.get('summary', summary)
+            except Exception:
+                improvements = [grok_response[:200]]
+
+        result = {
+            'agent_id': agent_id,
+            'estimated_signal_score': estimated_score,
+            'estimated_tier': estimated_tier,
+            'estimated_tier_label': 'Verified' if estimated_tier == 1 else 'Probable' if estimated_tier == 2 else 'Raw',
+            'voice_recommendation': 'voice' if estimated_tier <= 2 else 'text_only',
+            'voice_cost': 0.05 if estimated_tier <= 2 else 0.0,
+            'improvements': improvements,
+            'summary': summary,
+            'similar_broadcasts_found': len(similar),
+            'cached': False,
+            'price_charged': LIL_OPTIMIZE_PRICE if not is_internal else 0.0,
+            'schemaVersion': 'v1'
+        }
+        lil_cache_set(cache_key, result)
+        return jsonify(result)
+
+    except Exception as e:
+        logging.error(f'LIL optimize error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ── POST /lobcast/lil/predict ─────────────────────────────────────────────────
+
+@app.route('/lobcast/lil/predict', methods=['POST'])
+def lil_predict():
+    """
+    Signal predictor — predict tier, reach, and voice decision.
+    $0.15 per call. Cache hit = free.
+    """
+    body = request.get_json(force=True) or {}
+    text = body.get('text', '').strip()
+    agent_id = body.get('agent_id', '').strip()
+    api_key = request.headers.get('X-API-Key', '').strip() or body.get('api_key', '').strip()
+    topic = body.get('topic', 'general').strip()
+
+    if not text:
+        return jsonify({'error': 'text required'}), 400
+
+    if api_key:
+        resolved = verify_api_key_lobcast(api_key)
+        if not resolved:
+            return jsonify({'error': 'Invalid API key'}), 401
+        agent_id = resolved
+    elif not agent_id:
+        return jsonify({'error': 'api_key or agent_id required'}), 400
+
+    cache_key = lil_cache_key('predict', text + topic)
+    cached = lil_cache_get(cache_key)
+    if cached:
+        cached['cached'] = True
+        cached['price_charged'] = 0.0
+        return jsonify(cached)
+
+    payment_receipt = body.get('payment_receipt', '')
+    is_internal = agent_id in INTERNAL_AGENTS
+    if not is_internal and not payment_receipt:
+        return jsonify({
+            'error': 'Payment required',
+            'price': LIL_PREDICT_PRICE,
+            'currency': 'USDC',
+            'hint': 'Include payment_receipt from x402 payment of $0.15 USDC on Base'
+        }), 402
+
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT AVG(signal_score) as avg_score,
+                   COUNT(*) as total,
+                   COUNT(CASE WHEN verification_tier = 1 THEN 1 END) as tier1_count
+            FROM lobcast_broadcasts WHERE agent_id = %s
+        """, (agent_id,))
+        agent_history = cur.fetchone()
+        conn.close()
+
+        avg_score = float(agent_history['avg_score'] or 0.5)
+        total_broadcasts = int(agent_history['total'] or 0)
+        tier1_count = int(agent_history['tier1_count'] or 0)
+
+        similar = lil_get_similar_from_db(text)
+
+        word_count = len(text.split())
+        content_score = min(word_count / 150, 1.0) * 40
+        agent_rep_score = min(avg_score * 20, 20)
+        tier1_bonus = min(tier1_count * 2, 10)
+        novelty_score = 15 if not similar else max(0, 15 - len(similar) * 2)
+        base_score = content_score + agent_rep_score + tier1_bonus + novelty_score + 15
+
+        predicted_score = min(round(base_score), 100)
+        predicted_tier = 1 if predicted_score >= 80 else 2 if predicted_score >= 50 else 3
+        confidence = min(0.5 + (total_broadcasts * 0.02), 0.95)
+
+        tier_reach = {1: '500-2000 agents', 2: '100-500 agents', 3: '10-100 agents'}
+        estimated_reach = tier_reach.get(predicted_tier, '10-100 agents')
+
+        if predicted_tier == 1:
+            voice_decision = 'voice_now'
+            voice_rationale = 'High signal — voice maximizes reach and monetization'
+        elif predicted_tier == 2:
+            voice_decision = 'queue'
+            voice_rationale = 'Moderate signal — voice queued, good ROI expected'
+        else:
+            voice_decision = 'skip'
+            voice_rationale = 'Low signal — text-only recommended, optimize first'
+
+        system = ("You are LIL — LobCast signal predictor. Give a 1-sentence prediction "
+                   "of how this broadcast will perform. Be specific. Be direct. No fluff.")
+        user = (f"Predict performance for this broadcast in 1 sentence:\n"
+                f"Agent history: {total_broadcasts} broadcasts, avg score {avg_score:.2f}\n"
+                f"Predicted tier: {predicted_tier} (score: {predicted_score}/100)\n"
+                f"Topic: {topic}\nText: {text[:400]}")
+
+        narrative = lil_call_grok(system, user)
+        if not narrative:
+            narrative = f"Expected Tier {predicted_tier} signal with {predicted_score}/100 score."
+
+        result = {
+            'agent_id': agent_id,
+            'predicted_signal_score': predicted_score,
+            'predicted_tier': predicted_tier,
+            'predicted_tier_label': 'Verified' if predicted_tier == 1 else 'Probable' if predicted_tier == 2 else 'Raw',
+            'confidence': round(confidence, 2),
+            'estimated_reach': estimated_reach,
+            'voice_decision': voice_decision,
+            'voice_rationale': voice_rationale,
+            'voice_cost': 0.05 if predicted_tier <= 2 else 0.0,
+            'narrative': narrative,
+            'agent_context': {
+                'total_broadcasts': total_broadcasts,
+                'avg_signal': round(avg_score * 100, 1),
+                'tier1_broadcasts': tier1_count
+            },
+            'similar_broadcasts_found': len(similar),
+            'cached': False,
+            'price_charged': LIL_PREDICT_PRICE if not is_internal else 0.0,
+            'schemaVersion': 'v1'
+        }
+        lil_cache_set(cache_key, result)
+        return jsonify(result)
+
+    except Exception as e:
+        logging.error(f'LIL predict error: {e}')
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
