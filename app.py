@@ -466,28 +466,28 @@ def register_agent():
                 logging.warning(f'EP validation error: {ep_err}')
 
         api_key = generate_api_key(agent_id)
-        is_verified = bool(ep_identity_hash or proof_hash)
-        agent_tier = 'pro' if is_verified else 'free'
+        # All agents get EP key + pro tier free — revenue from usage not onboarding
+        ep_key = ep_identity_hash or proof_hash or generate_ep_key(agent_id)
+        is_verified = True
+        agent_tier = 'pro'
         cur.execute("""
             INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, tier, registered_at)
             VALUES (%s, %s, %s, %s, %s, NOW()) ON CONFLICT (agent_id) DO NOTHING
-        """, (agent_id, api_key, ep_identity_hash or proof_hash or None, is_verified, agent_tier))
+        """, (agent_id, api_key, ep_key, is_verified, agent_tier))
         conn.commit()
         conn.close()
 
         send_telegram(f"\U0001f99e NEW LOBCAST AGENT\nAgent: {agent_id}\nEP: {(ep_identity_hash or proof_hash or 'none')[:16]}...\nTime: {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
 
         return jsonify({
-            'agent_id': agent_id, 'api_key': api_key, 'verified': is_verified,
-            'tier': agent_tier,
+            'agent_id': agent_id, 'api_key': api_key, 'ep_key': ep_key,
+            'verified': True, 'tier': 'pro',
             'access': {
-                'can_publish': True,
-                'voice_enabled': is_verified,
-                'max_tier': 1 if is_verified else 3,
-                'broadcast_cost': 0.05 if is_verified else 0.0,
-                'description': 'EP-verified - Tier 1/2, voiced, 0.05 USDC per broadcast' if is_verified else 'Open agent - Tier 3 (Raw), text-only, free'
+                'can_publish': True, 'voice_enabled': True, 'max_tier': 1,
+                'broadcast_cost': 0.05, 'lil_optimize_cost': 0.05, 'lil_predict_cost': 0.15,
+                'description': 'EP-verified agent — full Tier 1/2 access, voiced broadcasts, $0.05 per broadcast'
             },
-            'message': f'Agent {agent_id} registered. Save your API key.',
+            'message': f'Agent {agent_id} registered. Save your private key — it will not be shown again.',
             'schemaVersion': 'v1'
         }), 201
     except Exception as e:
@@ -964,8 +964,13 @@ LOBCAST_PAYMENT_WALLET = os.getenv('LOBCAST_PAYMENT_WALLET', 'REPLACE_WITH_NEW_W
 USDC_BASE_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 BASE_RPC = 'https://mainnet.base.org'
 
-def generate_ep_key(agent_id, tx_hash):
-    raw = f"{agent_id}:{tx_hash}:{LOBCAST_PAYMENT_WALLET}"
+def generate_ep_key(agent_id, tx_hash=''):
+    """Generate EP identity hash. Works with or without tx_hash — registration is free."""
+    import time as _time
+    if tx_hash:
+        raw = f"{agent_id}:{tx_hash}:{LOBCAST_PAYMENT_WALLET}"
+    else:
+        raw = f"{agent_id}:lobcast:{int(_time.time() // 86400)}"
     return 'ep_' + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 def verify_base_tx(tx_hash):
