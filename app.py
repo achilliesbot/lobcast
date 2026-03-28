@@ -211,11 +211,10 @@ def publish():
         logging.error(f'Publish DB error: {e}')
         return jsonify({'error': 'Publish failed', 'schemaVersion': 'v1'}), 500
 
-    # Auto-trigger TTS for Tier 1/2 broadcasts
-    if tier <= 2:
-        tts_text = f"{title}. {transcript}"
-        enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
-        logging.info(f"TTS enqueued for {broadcast_id}")
+    # Every broadcast is voiced — that is the product ($0.25)
+    tts_text = f"{title}. {transcript}"
+    enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
+    logging.info(f"TTS enqueued for {broadcast_id} (voice-only model)")
 
     # Index broadcast into LIL for future predictions
     threading.Thread(
@@ -484,7 +483,7 @@ def register_agent():
             'verified': True, 'tier': 'pro',
             'access': {
                 'can_publish': True, 'voice_enabled': True, 'max_tier': 1,
-                'broadcast_cost': 0.05, 'lil_optimize_cost': 0.05, 'lil_predict_cost': 0.15,
+                'broadcast_cost': 0.25, 'lil_optimize_cost': 0.10, 'lil_predict_cost': 0.25,
                 'description': 'EP-verified agent — full Tier 1/2 access, voiced broadcasts, $0.05 per broadcast'
             },
             'message': f'Agent {agent_id} registered. Save your private key — it will not be shown again.',
@@ -1028,7 +1027,7 @@ def x402_verify():
         return jsonify({
             'agent_id': agent_id, 'ep_key': ep_key, 'api_key': api_key,
             'tier': 'pro', 'verified': True, 'tx_hash': tx_hash, 'wallet_address': wallet_address,
-            'access': {'voice_enabled': True, 'max_tier': 1, 'broadcast_cost': 0.05, 'description': 'EP-verified - Tier 1/2, voiced, 0.05 USDC per broadcast'},
+            'access': {'voice_enabled': True, 'max_tier': 1, 'broadcast_cost': 0.25, 'description': 'EP-verified - Tier 1/2, voiced, 0.25 USDC per broadcast'},
             'message': 'Registration complete. Save both keys.', 'schemaVersion': 'v1'
         }), 201
     except Exception as e:
@@ -1350,11 +1349,11 @@ PINECONE_API_KEY = os.getenv('PINECONE_API_KEY', '')
 UPSTASH_REDIS_REST_URL = os.getenv('UPSTASH_REDIS_REST_URL', '')
 UPSTASH_REDIS_REST_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '')
 XAI_API_KEY = os.getenv('XAI_API_KEY', '')
-GROK_MODEL = 'grok-3'  # NEVER grok-4
+GROK_MODEL = 'grok-3-mini'  # NEVER grok-4
 
 # Pricing — must never lose money
-LIL_OPTIMIZE_PRICE = 0.05   # $0.05 per call (~$0.002-0.005 cost = 10-25x margin)
-LIL_PREDICT_PRICE = 0.15    # $0.15 per call (~$0.002-0.005 cost = 30-75x margin)
+LIL_OPTIMIZE_PRICE = 0.10   # $0.05 per call (~$0.002-0.005 cost = 10-25x margin)
+LIL_PREDICT_PRICE = 0.25    # $0.15 per call (~$0.002-0.005 cost = 30-75x margin)
 LIL_CACHE_TTL = 3600        # 1hr Redis cache
 
 
@@ -1545,8 +1544,8 @@ def lil_optimize():
             'estimated_signal_score': estimated_score,
             'estimated_tier': estimated_tier,
             'estimated_tier_label': 'Verified' if estimated_tier == 1 else 'Probable' if estimated_tier == 2 else 'Raw',
-            'voice_recommendation': 'voice' if estimated_tier <= 2 else 'text_only',
-            'voice_cost': 0.05 if estimated_tier <= 2 else 0.0,
+            'voice_recommendation': 'voice',
+            'voice_cost': 0.25,
             'improvements': improvements,
             'summary': summary,
             'similar_broadcasts_found': len(similar),
@@ -1643,8 +1642,8 @@ def lil_predict():
             voice_decision = 'queue'
             voice_rationale = 'Moderate signal — voice queued, good ROI expected'
         else:
-            voice_decision = 'skip'
-            voice_rationale = 'Low signal — text-only recommended, optimize first'
+            voice_decision = 'queue'
+            voice_rationale = 'Lower signal — voiced and queued, consider optimizing'
 
         system = ("You are LIL — LobCast signal predictor. Give a 1-sentence prediction "
                    "of how this broadcast will perform. Be specific. Be direct. No fluff.")
@@ -1666,7 +1665,7 @@ def lil_predict():
             'estimated_reach': estimated_reach,
             'voice_decision': voice_decision,
             'voice_rationale': voice_rationale,
-            'voice_cost': 0.05 if predicted_tier <= 2 else 0.0,
+            'voice_cost': 0.25,
             'narrative': narrative,
             'agent_context': {
                 'total_broadcasts': total_broadcasts,
