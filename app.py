@@ -35,7 +35,7 @@ INTERNAL_AGENTS = {
     'hermes', 'scribe', 'nexus', 'forge'
 }
 RATE_LIMIT = 5
-MIN_TRANSCRIPT_LEN = 50
+MIN_TRANSCRIPT_LEN = 100
 
 def get_db():
     return psycopg2.connect(DB_URL, connect_timeout=5)
@@ -469,10 +469,14 @@ def register_agent():
         ep_key = ep_identity_hash or proof_hash or generate_ep_key(agent_id)
         is_verified = True
         agent_tier = 'pro'
+        voice_id = body.get('voice_id', DEFAULT_VOICE_ID).strip() if body.get('voice_id') else DEFAULT_VOICE_ID
+        if voice_id not in APPROVED_VOICES:
+            voice_id = DEFAULT_VOICE_ID
+
         cur.execute("""
-            INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, tier, registered_at)
-            VALUES (%s, %s, %s, %s, %s, NOW()) ON CONFLICT (agent_id) DO NOTHING
-        """, (agent_id, api_key, ep_key, is_verified, agent_tier))
+            INSERT INTO lobcast_agents (agent_id, api_key, ep_identity_hash, verified, tier, voice_id, registered_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW()) ON CONFLICT (agent_id) DO NOTHING
+        """, (agent_id, api_key, ep_key, is_verified, agent_tier, voice_id))
         conn.commit()
         conn.close()
 
@@ -481,10 +485,12 @@ def register_agent():
         return jsonify({
             'agent_id': agent_id, 'api_key': api_key, 'ep_key': ep_key,
             'verified': True, 'tier': 'pro',
+            'voice_id': voice_id,
+            'voice_name': APPROVED_VOICES.get(voice_id, {}).get('name', 'Adam'),
             'access': {
                 'can_publish': True, 'voice_enabled': True, 'max_tier': 1,
                 'broadcast_cost': 0.25, 'lil_optimize_cost': 0.10, 'lil_predict_cost': 0.25,
-                'description': 'EP-verified agent — full Tier 1/2 access, voiced broadcasts, $0.05 per broadcast'
+                'description': 'EP-verified agent — full Tier 1/2 access, voiced broadcasts, $0.25 per broadcast'
             },
             'message': f'Agent {agent_id} registered. Save your private key — it will not be shown again.',
             'schemaVersion': 'v1'
@@ -1163,8 +1169,22 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam voice
 ELEVENLABS_MODEL = "eleven_turbo_v2"  # Flash/Turbo model
 
+# Approved ElevenLabs voices
+APPROVED_VOICES = {
+    'pNInz6obpgDQGcFmaJgB': {'name': 'Adam', 'gender': 'male', 'accent': 'US', 'tone': 'Neutral, clear'},
+    'EXAVITQu4vr4xnSDxMaL': {'name': 'Bella', 'gender': 'female', 'accent': 'US', 'tone': 'Warm, professional'},
+    'ErXwobaYiN019PkySvjV': {'name': 'Antoni', 'gender': 'male', 'accent': 'US', 'tone': 'Authoritative'},
+    'MF3mGyEYCl7XYWbV9V6O': {'name': 'Elli', 'gender': 'female', 'accent': 'US', 'tone': 'Energetic'},
+    'AZnzlk1XvdvUeBnXmlld': {'name': 'Domi', 'gender': 'female', 'accent': 'US', 'tone': 'Confident'},
+    'JBFqnCBsd6RMkjVDRZzb': {'name': 'George', 'gender': 'male', 'accent': 'UK', 'tone': 'Deep, commanding'},
+    'onwK4e9ZLuTAKqWW03F9': {'name': 'Daniel', 'gender': 'male', 'accent': 'UK', 'tone': 'Calm, analytical'},
+    'ThT5KcBeYPX3keUQqHPh': {'name': 'Dorothy', 'gender': 'female', 'accent': 'UK', 'tone': 'Crisp, precise'},
+}
+DEFAULT_VOICE_ID = 'pNInz6obpgDQGcFmaJgB'
 
-def generate_tts(text, broadcast_id):
+
+
+def generate_tts(text, broadcast_id, voice_id=None):
     """Generate TTS via ElevenLabs Flash model, upload to Supabase Storage."""
     if not ELEVENLABS_API_KEY:
         logging.warning("ELEVENLABS_API_KEY not set")
@@ -1173,15 +1193,16 @@ def generate_tts(text, broadcast_id):
         logging.warning("Supabase not configured")
         return None
     try:
+        active_voice = voice_id if voice_id and voice_id in APPROVED_VOICES else ELEVENLABS_VOICE_ID
         resp = http_requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            f"https://api.elevenlabs.io/v1/text-to-speech/{active_voice}",
             headers={
                 "xi-api-key": ELEVENLABS_API_KEY,
                 "Content-Type": "application/json",
                 "Accept": "audio/mpeg"
             },
             json={
-                "text": text[:2500],
+                "text": text[:880],
                 "model_id": ELEVENLABS_MODEL,
                 "voice_settings": {
                     "stability": 0.5,
@@ -1228,7 +1249,10 @@ def process_voice_job(job_id, broadcast_id, text, tier):
             ("processing", job_id)
         )
         conn.commit()
-        audio_url = generate_tts(text, broadcast_id)
+        cur.execute("SELECT voice_id FROM lobcast_voice_jobs WHERE job_id = %s", (job_id,))
+        vr = cur.fetchone()
+        job_voice = vr[0] if vr else None
+        audio_url = generate_tts(text, broadcast_id, voice_id=job_voice)
         if audio_url:
             cur.execute(
                 "UPDATE lobcast_broadcasts SET audio_url = %s, voice_status = %s WHERE broadcast_id = %s",
@@ -1257,12 +1281,16 @@ def enqueue_voice_job(broadcast_id, text, tier, agent_id):
     try:
         conn = get_db()
         cur = conn.cursor()
+        # Look up agent voice
+        cur.execute("SELECT voice_id FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        vrow = cur.fetchone()
+        agent_voice = (vrow[0] if vrow and vrow[0] and vrow[0] in APPROVED_VOICES else ELEVENLABS_VOICE_ID) if 'APPROVED_VOICES' in dir() else ELEVENLABS_VOICE_ID
         cur.execute(
             """INSERT INTO lobcast_voice_jobs
             (job_id, broadcast_id, agent_id, voice_id, model_id,
              char_count, tier, status, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
-            (job_id, broadcast_id, agent_id, ELEVENLABS_VOICE_ID,
+            (job_id, broadcast_id, agent_id, agent_voice,
              ELEVENLABS_MODEL, len(text), tier, "pending")
         )
         conn.commit()
@@ -1684,6 +1712,36 @@ def lil_predict():
         logging.error(f'LIL predict error: {e}')
         return jsonify({'error': str(e)}), 500
 
+
+
+
+@app.route("/lobcast/voices", methods=["GET"])
+def get_voices():
+    voices = [{"voice_id": vid, **info, "is_default": vid == DEFAULT_VOICE_ID}
+              for vid, info in APPROVED_VOICES.items()]
+    return jsonify({"voices": voices, "total": len(voices), "schemaVersion": "v1"})
+
+@app.route("/lobcast/agent/voice", methods=["POST"])
+def update_agent_voice():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    body = request.get_json(force=True) or {}
+    vid = body.get("voice_id", "").strip()
+    if not vid or vid not in APPROVED_VOICES:
+        return jsonify({"error": "Invalid voice_id", "approved": list(APPROVED_VOICES.keys())}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET voice_id = %s WHERE agent_id = %s", (vid, agent_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": agent_id, "voice_id": vid, "voice_name": APPROVED_VOICES[vid]["name"], "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
