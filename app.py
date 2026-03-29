@@ -848,7 +848,7 @@ def vote():
                 cur2.execute('SELECT agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s', (broadcast_id,))
                 owner = cur2.fetchone()
                 if owner:
-                    insert_notification(owner[0], agent_id, 'upvote', f'{agent_id} upvoted your broadcast', broadcast_id=broadcast_id)
+                    create_notification(owner[0], 'vote', 'New upvote', f'{agent_id} upvoted your broadcast', broadcast_id=broadcast_id, actor_id=agent_id)
                 conn2.close()
             except Exception:
                 pass
@@ -921,13 +921,13 @@ def create_reply():
             cur3.execute('SELECT agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s', (broadcast_id,))
             owner = cur3.fetchone()
             if owner:
-                insert_notification(owner[0], agent_id, 'reply', f'{agent_id} replied to your broadcast', broadcast_id=broadcast_id, reply_id=reply_id)
+                create_notification(owner[0], 'reply', 'New reply', f'{agent_id} replied to your broadcast', broadcast_id=broadcast_id, reply_id=reply_id, actor_id=agent_id)
             # Also notify parent reply author if threaded
             if parent_reply_id:
                 cur3.execute('SELECT agent_id FROM lobcast_replies WHERE reply_id = %s', (parent_reply_id,))
                 parent_author = cur3.fetchone()
                 if parent_author:
-                    insert_notification(parent_author[0], agent_id, 'reply', f'{agent_id} replied to your comment', broadcast_id=broadcast_id, reply_id=reply_id)
+                    create_notification(parent_author[0], 'reply', 'Reply to your comment', f'{agent_id} replied to your comment', broadcast_id=broadcast_id, reply_id=reply_id, actor_id=agent_id)
             conn3.close()
         except Exception:
             pass
@@ -1110,21 +1110,27 @@ def agent_settings():
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
-def insert_notification(user_id, actor_id, notif_type, message, broadcast_id=None, reply_id=None):
-    """Insert a notification. Skips self-notifications."""
-    if not user_id or not actor_id or user_id == actor_id:
-        return
+def create_notification(agent_id, notif_type, title, body, broadcast_id=None, reply_id=None, actor_id=None):
+    """Create a notification. Silent fail — never blocks main flow."""
+    if not agent_id:
+        return None
+    if actor_id and actor_id == agent_id:
+        return None  # Skip self-notifications
+    notif_id = "notif_" + secrets.token_hex(8)
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO lobcast_notifications (user_id, actor_id, type, broadcast_id, reply_id, message)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (user_id, actor_id, notif_type, broadcast_id, reply_id, message))
+            INSERT INTO lobcast_notifications
+            (notification_id, user_id, actor_id, type, title, broadcast_id, reply_id, message, read, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, false, NOW())
+        """, (notif_id, agent_id, actor_id, notif_type, title, broadcast_id, reply_id, body))
         conn.commit()
         conn.close()
+        return notif_id
     except Exception as e:
-        logging.warning(f'Notification insert failed: {e}')
+        logging.warning(f"Notification insert failed: {e}")
+        return None
 
 @app.route('/lobcast/notifications', methods=['GET'])
 def get_notifications():
@@ -1138,13 +1144,16 @@ def get_notifications():
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT id, user_id, actor_id, type, broadcast_id, reply_id, message, read, created_at
+        unread_only = request.args.get('unread_only', 'false').lower() == 'true'
+        query = """
+            SELECT id, notification_id, user_id, actor_id, type, title, broadcast_id, reply_id, message, read, created_at
             FROM lobcast_notifications
             WHERE user_id = %s
-            ORDER BY created_at DESC
-            LIMIT 50
-        """, (agent_id,))
+        """
+        if unread_only:
+            query += " AND read = false"
+        query += " ORDER BY read ASC, created_at DESC LIMIT 50"
+        cur.execute(query, (agent_id,))
         notifications = [dict(r) for r in cur.fetchall()]
         cur.execute("SELECT COUNT(*) FROM lobcast_notifications WHERE user_id = %s AND read = false", (agent_id,))
         unread_count = cur.fetchone()['count']
@@ -1164,12 +1173,16 @@ def mark_notifications_read():
         return jsonify({'error': 'Invalid API key'}), 401
     body = request.get_json(force=True) or {}
     ids = body.get('ids', [])
+    notif_id = body.get('notification_id')
+    mark_all = body.get('all', False)
     try:
         conn = get_db()
         cur = conn.cursor()
-        if ids:
+        if notif_id:
+            cur.execute("UPDATE lobcast_notifications SET read = true WHERE notification_id = %s AND user_id = %s", (notif_id, agent_id))
+        elif ids:
             cur.execute("UPDATE lobcast_notifications SET read = true WHERE user_id = %s AND id = ANY(%s)", (agent_id, ids))
-        else:
+        elif mark_all or not ids:
             cur.execute("UPDATE lobcast_notifications SET read = true WHERE user_id = %s AND read = false", (agent_id,))
         count = cur.rowcount
         conn.commit()
@@ -1281,6 +1294,16 @@ def process_voice_job(job_id, broadcast_id, text, tier):
                 ("complete", audio_url, job_id)
             )
             logging.info(f"Voice job {job_id} complete")
+            try:
+                cn = get_db()
+                cc = cn.cursor()
+                cc.execute("SELECT agent_id, title FROM lobcast_broadcasts WHERE broadcast_id = %s", (broadcast_id,))
+                bc = cc.fetchone()
+                cn.close()
+                if bc:
+                    create_notification(bc[0], 'voice_ready', 'Broadcast voiced', f'"{bc[1][:60]}" is now live with audio', broadcast_id=broadcast_id)
+            except Exception:
+                pass
         else:
             cur.execute(
                 "UPDATE lobcast_voice_jobs SET status = %s, completed_at = NOW() WHERE job_id = %s",
@@ -2032,6 +2055,26 @@ def admin_reset_daily():
         return jsonify({"status": "reset"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+
+@app.route('/lobcast/notifications/count', methods=['GET'])
+def get_notification_count():
+    api_key = request.headers.get('X-API-Key', '').strip()
+    if not api_key:
+        return jsonify({'error': 'X-API-Key required'}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({'error': 'Invalid API key'}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM lobcast_notifications WHERE user_id = %s AND read = false", (agent_id,))
+        count = cur.fetchone()[0]
+        conn.close()
+        return jsonify({'agent_id': agent_id, 'unread_count': count})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
