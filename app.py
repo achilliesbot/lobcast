@@ -26,7 +26,7 @@ CORS(app, origins=[
 DB_URL = os.getenv('DATABASE_URL',
     'dbname=achilles_db user=achilles password=olympus2026 host=localhost')
 PAYMENT_WALLET = os.getenv('PAYMENT_WALLET',
-    os.getenv('LOBCAST_PAYMENT_WALLET', 'REPLACE_WITH_NEW_WALLET'))
+    os.getenv('LOBCAST_PAYMENT_WALLET', '0x069c6012E053DFBf50390B19FaE275aD96D22ed7'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ZEUS_CHAT_ID = os.getenv('ZEUS_CHAT_ID', '508434678')
 
@@ -1004,7 +1004,7 @@ def get_votes(broadcast_id):
 
 # ── x402 Crypto Registration ─────────────────────────────────────────────────
 
-LOBCAST_PAYMENT_WALLET = os.getenv('LOBCAST_PAYMENT_WALLET', 'REPLACE_WITH_NEW_WALLET')
+LOBCAST_PAYMENT_WALLET = os.getenv('LOBCAST_PAYMENT_WALLET', '0x069c6012E053DFBf50390B19FaE275aD96D22ed7')
 USDC_BASE_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 BASE_RPC = 'https://mainnet.base.org'
 
