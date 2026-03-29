@@ -224,6 +224,27 @@ def publish():
 
     increment_broadcast_count(agent_id)
 
+    # Compute proof hashes + anchor to Base Mainnet in background
+    from datetime import datetime as _pub_dt
+    publish_ts = _pub_dt.utcnow().isoformat()
+    try:
+        ph, ch = compute_proof_hashes(agent_id, title, transcript, publish_ts)
+        conn2 = get_db()
+        cur2 = conn2.cursor()
+        cur2.execute("UPDATE lobcast_broadcasts SET proof_hash = %s, content_hash = %s WHERE broadcast_id = %s", (ph, ch, broadcast_id))
+        conn2.commit()
+        cur2.execute("SELECT ep_identity_hash FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        ep_row = cur2.fetchone()
+        conn2.close()
+        ep_val = ep_row[0] if ep_row else ""
+        threading.Thread(
+            target=anchor_broadcast_onchain,
+            args=(broadcast_id, agent_id, title, transcript, ep_val, tier, signal_score, publish_ts),
+            daemon=True
+        ).start()
+    except Exception as _anch_err:
+        logging.error(f"Anchoring setup error: {_anch_err}")
+
     # Every broadcast is voiced — that is the product ($0.25)
     tts_text = f"{title}. {transcript}"
     enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
@@ -2075,6 +2096,133 @@ def get_notification_count():
         return jsonify({'agent_id': agent_id, 'unread_count': count})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# On-Chain Proof Anchoring — Base Mainnet LobcastRegistry
+# ══════════════════════════════════════════════════════════════════════════════
+
+# CRITICAL: Correct wallet 0x069c6012E053DFBf50390B19FaE275aD96D22ed7
+# CRITICAL: NEVER use compromised 0x16708f79D6366eE32774048ECC7878617236Ca5C
+LOBCAST_REGISTRY_ADDRESS = os.getenv("LOBCAST_REGISTRY_ADDRESS", "")
+LOBCAST_WALLET_PRIVATE_KEY = os.getenv("LOBCAST_WALLET_PRIVATE_KEY", "")
+BASE_RPC_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+COMPROMISED_WALLET = "0x16708f79D6366eE32774048ECC7878617236Ca5C"
+
+
+def compute_proof_hashes(agent_id, title, content, timestamp):
+    proof_input = f"{agent_id}:{title}:{content}:{timestamp}"
+    proof_hash = hashlib.sha256(proof_input.encode()).hexdigest()
+    content_hash_val = hashlib.sha256(content.encode()).hexdigest()
+    return proof_hash, content_hash_val
+
+
+def anchor_broadcast_onchain(broadcast_id, agent_id, title, content,
+                              ep_key, tier, signal_score, timestamp):
+    """Anchor proof to Base Mainnet. Runs in background thread."""
+    if not LOBCAST_WALLET_PRIVATE_KEY or not LOBCAST_REGISTRY_ADDRESS:
+        logging.info(f"On-chain anchoring skipped for {broadcast_id} — keys not set")
+        return
+    try:
+        from web3 import Web3
+        from eth_account import Account
+
+        account = Account.from_key(LOBCAST_WALLET_PRIVATE_KEY)
+        if account.address.lower() == COMPROMISED_WALLET.lower():
+            logging.critical("COMPROMISED WALLET DETECTED — anchoring aborted")
+            return
+
+        w3 = Web3(Web3.HTTPProvider(BASE_RPC_URL))
+        if not w3.is_connected():
+            logging.error("Cannot connect to Base Mainnet")
+            return
+
+        proof_hash_hex, content_hash_hex = compute_proof_hashes(
+            agent_id, title, content, timestamp
+        )
+
+        # Minimal ABI for anchorBroadcast
+        abi = [{"inputs":[{"name":"broadcastId","type":"string"},{"name":"proofHash","type":"bytes32"},{"name":"contentHash","type":"bytes32"},{"name":"epKey","type":"string"},{"name":"tier","type":"uint8"},{"name":"signalScore","type":"uint8"}],"name":"anchorBroadcast","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
+        registry = w3.eth.contract(
+            address=Web3.to_checksum_address(LOBCAST_REGISTRY_ADDRESS), abi=abi
+        )
+
+        score_int = min(int(signal_score * 100), 100)
+        nonce = w3.eth.get_transaction_count(account.address)
+
+        tx = registry.functions.anchorBroadcast(
+            broadcast_id,
+            bytes.fromhex(proof_hash_hex),
+            bytes.fromhex(content_hash_hex),
+            ep_key or "",
+            tier,
+            score_int
+        ).build_transaction({
+            "from": account.address,
+            "nonce": nonce,
+            "gas": 150000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 8453
+        })
+
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        logging.info(f"On-chain tx sent for {broadcast_id}: {tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE lobcast_broadcasts
+            SET onchain_tx_hash = %s, onchain_block = %s,
+                onchain_status = 'anchored', onchain_anchored_at = NOW(),
+                proof_hash = %s, content_hash = %s
+            WHERE broadcast_id = %s
+        """, (tx_hash.hex(), receipt.blockNumber,
+              proof_hash_hex, content_hash_hex, broadcast_id))
+        conn.commit()
+        conn.close()
+        logging.info(f"Anchored {broadcast_id} — block {receipt.blockNumber}")
+
+    except Exception as e:
+        logging.error(f"Anchoring error for {broadcast_id}: {e}")
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("UPDATE lobcast_broadcasts SET onchain_status = 'failed' WHERE broadcast_id = %s", (broadcast_id,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/lobcast/broadcast/onchain/<broadcast_id>", methods=["GET"])
+def get_onchain_status(broadcast_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT broadcast_id, proof_hash, content_hash,
+                   onchain_tx_hash, onchain_block, onchain_status,
+                   onchain_anchored_at, signal_score, verification_tier,
+                   agent_id, title, published_at
+            FROM lobcast_broadcasts WHERE broadcast_id = %s
+        """, (broadcast_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Not found"}), 404
+        result = dict(row)
+        if result.get("onchain_tx_hash"):
+            result["basescan_url"] = f"https://basescan.org/tx/{result['onchain_tx_hash']}"
+        if LOBCAST_REGISTRY_ADDRESS:
+            result["registry_address"] = LOBCAST_REGISTRY_ADDRESS
+        return jsonify({**result, "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
