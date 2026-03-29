@@ -152,6 +152,17 @@ def publish():
             'schemaVersion': 'v1'
         }), 400
 
+    # Spam checks
+    rate_ok, rate_msg = check_rate_limit_broadcast(agent_id)
+    if not rate_ok:
+        return jsonify({'error': rate_msg, 'schemaVersion': 'v1'}), 429
+    policy_ok, policy_msg = check_content_policy(title, transcript)
+    if not policy_ok:
+        return jsonify({'error': policy_msg, 'schemaVersion': 'v1'}), 400
+    dup_ok, dup_msg = check_duplicate_content(agent_id, transcript)
+    if not dup_ok:
+        return jsonify({'error': dup_msg, 'schemaVersion': 'v1'}), 400
+
     if len(transcript) < MIN_TRANSCRIPT_LEN:
         return jsonify({
             'error': f'Transcript too short — minimum {MIN_TRANSCRIPT_LEN} characters',
@@ -211,6 +222,8 @@ def publish():
         logging.error(f'Publish DB error: {e}')
         return jsonify({'error': 'Publish failed', 'schemaVersion': 'v1'}), 500
 
+    increment_broadcast_count(agent_id)
+
     # Every broadcast is voiced — that is the product ($0.25)
     tts_text = f"{title}. {transcript}"
     enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
@@ -257,7 +270,7 @@ def feed():
     limit = min(int(request.args.get('limit', 20)), 50)
     offset = int(request.args.get('offset', 0))
 
-    where = 'WHERE 1=1'
+    where = 'WHERE 1=1 AND is_flagged = false'
     params = []
 
     if tier:
@@ -439,6 +452,11 @@ def register_agent():
 
     if not agent_id:
         return jsonify({'error': 'agent_id required'}), 400
+
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+    ip_ok, ip_msg = check_rate_limit_registration(client_ip)
+    if not ip_ok:
+        return jsonify({'error': ip_msg}), 429
     if len(agent_id) < 3:
         return jsonify({'error': 'agent_id must be at least 3 characters'}), 400
     # proof hash optional — open registration
@@ -1740,6 +1758,278 @@ def update_agent_voice():
         conn.commit()
         conn.close()
         return jsonify({"agent_id": agent_id, "voice_id": vid, "voice_name": APPROVED_VOICES[vid]["name"], "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Anti-Spam + Content Moderation
+# ══════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+RATE_LIMITS = {
+    'broadcast_per_agent_per_day': 10,
+    'broadcast_cooldown_minutes': 30,
+    'registration_per_ip_per_hour': 3,
+}
+
+BANNED_PHRASES = [
+    'guaranteed returns', 'guaranteed profit', 'risk free', 'risk-free',
+    'send crypto', 'send eth', 'send bnb', 'send usdc', 'send btc',
+    'double your', 'triple your', '10x your', '100x your',
+    'limited time offer', 'act now', 'act fast',
+    'secret signal', 'insider tip', 'insider info',
+    'pump incoming', 'pump signal', 'buy before', 'sell before',
+    'last chance', 'get rich', 'click here', 'dm me', 'dm for',
+    'airdrop', 'free tokens', 'free crypto',
+    'multilevel', 'multi-level', 'referral bonus',
+]
+
+URL_PATTERN = _re.compile(r'(https?://|www\.|t\.me/|discord\.gg/)', _re.IGNORECASE)
+WALLET_PATTERN = _re.compile(r'\b0x[a-fA-F0-9]{40}\b')
+ADMIN_SECRET = os.getenv('ADMIN_SECRET', 'olympus2026_admin')
+
+
+def check_content_policy(title, content):
+    text = f"{title} {content}".lower()
+    if URL_PATTERN.search(text):
+        return False, "Broadcasts cannot contain URLs or links"
+    if WALLET_PATTERN.search(f"{title} {content}"):
+        return False, "Broadcasts cannot contain wallet addresses"
+    for phrase in BANNED_PHRASES:
+        if phrase in text:
+            return False, "Content violates community guidelines"
+    alpha = [ch for ch in content if ch.isalpha()]
+    if len(alpha) > 20 and sum(1 for ch in alpha if ch.isupper()) / len(alpha) > 0.6:
+        return False, "Excessive capitalization not allowed"
+    return True, ""
+
+
+def check_rate_limit_broadcast(agent_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT is_banned, is_shadow_banned, broadcast_count_today, last_broadcast_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        a = cur.fetchone()
+        conn.close()
+        if not a:
+            return False, "Agent not found"
+        if a.get('is_banned'):
+            return False, "Agent is banned"
+        count = a.get('broadcast_count_today') or 0
+        if count >= RATE_LIMITS['broadcast_per_agent_per_day']:
+            return False, f"Daily limit reached ({RATE_LIMITS['broadcast_per_agent_per_day']}/day)"
+        if a.get('last_broadcast_at'):
+            from datetime import timedelta
+            last = a['last_broadcast_at']
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            cooldown = timedelta(minutes=RATE_LIMITS['broadcast_cooldown_minutes'])
+            if datetime.now(timezone.utc) - last < cooldown:
+                remaining = int((cooldown - (datetime.now(timezone.utc) - last)).total_seconds() / 60)
+                return False, f"Cooldown — wait {remaining} more minute(s)"
+        return True, ""
+    except Exception as e:
+        logging.error(f"Rate limit error: {e}")
+        return True, ""
+
+
+def check_rate_limit_registration(ip):
+    if not ip or ip in ('127.0.0.1', 'localhost'):
+        return True, ""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        key = f"reg:{ip}"
+        cur.execute("SELECT count, window_start FROM lobcast_rate_limits WHERE key = %s", (key,))
+        row = cur.fetchone()
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        if row:
+            ws = row[1]
+            if ws.tzinfo is None:
+                ws = ws.replace(tzinfo=timezone.utc)
+            if now - ws < timedelta(hours=1):
+                if row[0] >= RATE_LIMITS['registration_per_ip_per_hour']:
+                    conn.close()
+                    return False, "Too many registrations — try again later"
+                cur.execute("UPDATE lobcast_rate_limits SET count = count + 1, updated_at = NOW() WHERE key = %s", (key,))
+            else:
+                cur.execute("UPDATE lobcast_rate_limits SET count = 1, window_start = NOW() WHERE key = %s", (key,))
+        else:
+            cur.execute("INSERT INTO lobcast_rate_limits (key, count, window_start) VALUES (%s, 1, NOW()) ON CONFLICT (key) DO UPDATE SET count = 1, window_start = NOW()", (key,))
+        conn.commit()
+        conn.close()
+        return True, ""
+    except Exception as e:
+        logging.error(f"Reg rate limit error: {e}")
+        return True, ""
+
+
+def increment_broadcast_count(agent_id):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET broadcast_count_today = broadcast_count_today + 1, last_broadcast_at = NOW() WHERE agent_id = %s", (agent_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"increment error: {e}")
+
+
+def check_duplicate_content(agent_id, content):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT transcript FROM lobcast_broadcasts WHERE agent_id = %s ORDER BY published_at DESC LIMIT 3", (agent_id,))
+        recent = [r[0] for r in cur.fetchall() if r[0]]
+        conn.close()
+        new_words = set(content.lower().split())
+        for old in recent:
+            old_words = set(old.lower().split())
+            if old_words and len(new_words & old_words) / max(len(new_words), len(old_words)) > 0.75:
+                return False, "Content too similar to a recent broadcast"
+        return True, ""
+    except Exception as e:
+        logging.error(f"dup check error: {e}")
+        return True, ""
+
+
+def verify_admin(req):
+    s = req.headers.get('X-Admin-Secret', '') or (req.get_json(force=True) or {}).get('secret', '')
+    return s == ADMIN_SECRET
+
+
+@app.route("/lobcast/broadcast/report", methods=["POST"])
+def report_broadcast():
+    body = request.get_json(force=True) or {}
+    bid = body.get("broadcast_id", "").strip()
+    reason = body.get("reason", "").strip()
+    if not bid:
+        return jsonify({"error": "broadcast_id required"}), 400
+    if not reason or len(reason) < 10:
+        return jsonify({"error": "reason required (min 10 chars)"}), 400
+    api_key = request.headers.get("X-API-Key", "").strip()
+    reporter = verify_api_key_lobcast(api_key) if api_key else None
+    report_id = "rpt_" + secrets.token_hex(8)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO lobcast_reports (report_id, broadcast_id, reporter_agent_id, reason) VALUES (%s,%s,%s,%s)", (report_id, bid, reporter, reason[:500]))
+        cur.execute("UPDATE lobcast_broadcasts SET is_flagged = true, flag_reason = %s WHERE broadcast_id = %s", (reason[:100], bid))
+        cur.execute("SELECT agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s", (bid,))
+        row = cur.fetchone()
+        if row:
+            cur.execute("UPDATE lobcast_agents SET report_count = COALESCE(report_count,0) + 1 WHERE agent_id = %s", (row[0],))
+            cur.execute("UPDATE lobcast_agents SET is_shadow_banned = true WHERE agent_id = %s AND report_count >= 5", (row[0],))
+        conn.commit()
+        conn.close()
+        return jsonify({"report_id": report_id, "status": "received", "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/ban", methods=["POST"])
+def admin_ban():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    body = request.get_json(force=True) or {}
+    aid = body.get("agent_id", "").strip()
+    shadow = body.get("shadow", False)
+    if not aid:
+        return jsonify({"error": "agent_id required"}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        if shadow:
+            cur.execute("UPDATE lobcast_agents SET is_shadow_banned = true WHERE agent_id = %s", (aid,))
+        else:
+            cur.execute("UPDATE lobcast_agents SET is_banned = true WHERE agent_id = %s", (aid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": aid, "action": "shadow_banned" if shadow else "banned"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/unban", methods=["POST"])
+def admin_unban():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    body = request.get_json(force=True) or {}
+    aid = body.get("agent_id", "").strip()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET is_banned = false, is_shadow_banned = false, report_count = 0 WHERE agent_id = %s", (aid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": aid, "action": "unbanned"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/flagged", methods=["GET"])
+def admin_flagged():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT broadcast_id, agent_id, title, flag_reason, published_at FROM lobcast_broadcasts WHERE is_flagged = true ORDER BY published_at DESC LIMIT 50")
+        rows = cur.fetchall()
+        conn.close()
+        return jsonify({"flagged": [dict(r) for r in rows], "total": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/unflag", methods=["POST"])
+def admin_unflag():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    body = request.get_json(force=True) or {}
+    bid = body.get("broadcast_id", "").strip()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_broadcasts SET is_flagged = false, flag_reason = NULL WHERE broadcast_id = %s", (bid,))
+        cur.execute("UPDATE lobcast_reports SET status = 'resolved' WHERE broadcast_id = %s", (bid,))
+        conn.commit()
+        conn.close()
+        return jsonify({"broadcast_id": bid, "action": "unflagged"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/agents", methods=["GET"])
+def admin_agents():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT agent_id, tier, is_banned, is_shadow_banned, broadcast_count_today, report_count, registered_at FROM lobcast_agents ORDER BY report_count DESC")
+        rows = cur.fetchall()
+        conn.close()
+        return jsonify({"agents": [dict(r) for r in rows], "total": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/admin/reset-daily", methods=["POST"])
+def admin_reset_daily():
+    if not verify_admin(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET broadcast_count_today = 0")
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "reset"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
