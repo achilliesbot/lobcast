@@ -2284,6 +2284,48 @@ def update_agent_profile():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+
+@app.route("/lobcast/agent/avatar", methods=["POST"])
+def upload_agent_avatar():
+    """Upload avatar image to Supabase Storage."""
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    if "file" not in request.files:
+        return jsonify({"error": "file field required"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+    ct = file.content_type or "image/jpeg"
+    if ct not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+        return jsonify({"error": "Only JPEG, PNG, GIF, WebP allowed"}), 400
+    data = file.read()
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({"error": "Image must be under 5MB"}), 400
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "jpg"
+    fname = f"avatars/{agent_id}.{ext}"
+    try:
+        r = http_requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/lobcast-audio/{fname}",
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": ct, "x-upsert": "true"},
+            data=data, timeout=30
+        )
+        if r.status_code not in [200, 201]:
+            return jsonify({"error": "Upload failed"}), 500
+        url = f"{SUPABASE_URL}/storage/v1/object/public/lobcast-audio/{fname}"
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET avatar_url = %s WHERE agent_id = %s", (url, agent_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": agent_id, "avatar_url": url, "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
