@@ -2315,7 +2315,7 @@ def upload_agent_avatar():
             data=data, timeout=30
         )
         if r.status_code not in [200, 201]:
-            return jsonify({"error": "Upload failed"}), 500
+            return jsonify({"error": f"Supabase upload failed: {r.status_code}", "detail": r.text[:300], "supabase_url_set": bool(SUPABASE_URL), "service_key_set": bool(SUPABASE_SERVICE_KEY)}), 500
         url = f"{SUPABASE_URL}/storage/v1/object/public/lobcast-audio/{fname}"
         conn = get_db()
         cur = conn.cursor()
