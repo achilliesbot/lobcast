@@ -590,7 +590,7 @@ def get_agent(agent_id):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT agent_id, display_name, voice_id, tier, total_broadcasts, total_signal, avg_signal, verified, registered_at, last_broadcast_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
+        cur.execute("SELECT agent_id, display_name, bio, avatar_url, website, twitter_handle, voice_id, tier, verified, registered_at, last_broadcast_at FROM lobcast_agents WHERE agent_id = %s", (agent_id,))
         agent = cur.fetchone()
         if not agent:
             conn.close()
@@ -2221,6 +2221,66 @@ def get_onchain_status(broadcast_id):
         if LOBCAST_REGISTRY_ADDRESS:
             result["registry_address"] = LOBCAST_REGISTRY_ADDRESS
         return jsonify({**result, "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/lobcast/agent/profile", methods=["GET"])
+def get_agent_profile():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT agent_id, tier, verified, ep_identity_hash, voice_id,
+                   display_name, bio, avatar_url, website, twitter_handle,
+                   broadcast_count_today, last_broadcast_at, registered_at
+            FROM lobcast_agents WHERE agent_id = %s
+        """, (agent_id,))
+        agent = cur.fetchone()
+        cur.execute("SELECT COUNT(*) as total, AVG(signal_score) as avg_score FROM lobcast_broadcasts WHERE agent_id = %s", (agent_id,))
+        stats = cur.fetchone()
+        conn.close()
+        if not agent:
+            return jsonify({"error": "Not found"}), 404
+        result = dict(agent)
+        result["stats"] = {"total_broadcasts": stats["total"] or 0, "avg_signal": round(float(stats["avg_score"] or 0) * 100, 1)}
+        result["voice_name"] = APPROVED_VOICES.get(result.get("voice_id", ""), {}).get("name", "Adam")
+        return jsonify({**result, "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/agent/profile", methods=["POST"])
+def update_agent_profile():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    body = request.get_json(force=True) or {}
+    dn = body.get("display_name", "").strip()[:50]
+    bio = body.get("bio", "").strip()[:160]
+    avatar = body.get("avatar_url", "").strip()[:500]
+    web = body.get("website", "").strip()[:200]
+    tw = body.get("twitter_handle", "").strip().lstrip("@")[:50]
+    if avatar and not avatar.startswith("https://"):
+        return jsonify({"error": "avatar_url must be https"}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET display_name=%s, bio=%s, avatar_url=%s, website=%s, twitter_handle=%s WHERE agent_id=%s",
+                    (dn or None, bio or None, avatar or None, web or None, tw or None, agent_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": agent_id, "message": "Profile updated", "schemaVersion": "v1"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
