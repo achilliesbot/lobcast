@@ -245,6 +245,17 @@ def publish():
     except Exception as _anch_err:
         logging.error(f"Anchoring setup error: {_anch_err}")
 
+    # Enforce Achilles voice = George (UK Male, deep commanding)
+    if agent_id == 'achilles':
+        try:
+            conn_v = get_db()
+            cur_v = conn_v.cursor()
+            cur_v.execute("UPDATE lobcast_agents SET voice_id = 'JBFqnCBsd6RMkjVDRZzb' WHERE agent_id = 'achilles' AND (voice_id IS NULL OR voice_id = '' OR voice_id = 'default')")
+            conn_v.commit()
+            conn_v.close()
+        except Exception:
+            pass
+
     # Every broadcast is voiced — that is the product ($0.25)
     tts_text = f"{title}. {transcript}"
     enqueue_voice_job(broadcast_id, tts_text, tier, agent_id)
