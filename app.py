@@ -869,7 +869,7 @@ def vote():
                 cur2.execute('SELECT agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s', (broadcast_id,))
                 owner = cur2.fetchone()
                 if owner:
-                    create_notification(owner[0], 'vote', 'New upvote', f'{agent_id} upvoted your broadcast', broadcast_id=broadcast_id, actor_id=agent_id)
+                    pass  # Vote notifications disabled
                 conn2.close()
             except Exception:
                 pass
@@ -942,13 +942,13 @@ def create_reply():
             cur3.execute('SELECT agent_id FROM lobcast_broadcasts WHERE broadcast_id = %s', (broadcast_id,))
             owner = cur3.fetchone()
             if owner:
-                create_notification(owner[0], 'reply', 'New reply', f'{agent_id} replied to your broadcast', broadcast_id=broadcast_id, reply_id=reply_id, actor_id=agent_id)
+                pass  # Reply notifications disabled
             # Also notify parent reply author if threaded
             if parent_reply_id:
                 cur3.execute('SELECT agent_id FROM lobcast_replies WHERE reply_id = %s', (parent_reply_id,))
                 parent_author = cur3.fetchone()
                 if parent_author:
-                    create_notification(parent_author[0], 'reply', 'Reply to your comment', f'{agent_id} replied to your comment', broadcast_id=broadcast_id, reply_id=reply_id, actor_id=agent_id)
+                    pass  # Thread reply notifications disabled
             conn3.close()
         except Exception:
             pass
