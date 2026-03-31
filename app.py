@@ -1441,6 +1441,11 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN', '')
 XAI_API_KEY = os.getenv('XAI_API_KEY', '')
 GROK_MODEL = 'grok-3-mini'  # NEVER grok-4
 
+# BANKR LLM Gateway (primary LLM for LIL — powered by BANKR)
+BANKR_LLM_KEY = os.getenv('BANKR_LLM_KEY', '')
+BANKR_LLM_ENDPOINT = os.getenv('BANKR_LLM_ENDPOINT', 'https://llm.bankr.bot')
+BANKR_LLM_MODEL = os.getenv('BANKR_LLM_MODEL', 'claude-haiku-4-5-20251001')
+
 # Pricing — must never lose money
 LIL_OPTIMIZE_PRICE = 0.10   # $0.05 per call (~$0.002-0.005 cost = 10-25x margin)
 LIL_PREDICT_PRICE = 0.25    # $0.15 per call (~$0.002-0.005 cost = 30-75x margin)
@@ -1490,25 +1495,45 @@ def lil_cache_key(prefix, text):
 
 
 def lil_call_grok(system_prompt, user_prompt):
-    """Call Grok-3 via XAI API. NEVER use grok-4."""
+    """Call LLM for LIL. Tries BANKR first, falls back to Grok-3-mini."""
+    # Try BANKR LLM Gateway first (powered by BANKR)
+    if BANKR_LLM_KEY:
+        try:
+            resp = http_requests.post(
+                f'{BANKR_LLM_ENDPOINT}/v1/chat/completions',
+                headers={'Content-Type': 'application/json', 'X-API-Key': BANKR_LLM_KEY},
+                json={
+                    'model': BANKR_LLM_MODEL,
+                    'messages': [
+                        {'role': 'system', 'content': system_prompt},
+                        {'role': 'user', 'content': user_prompt}
+                    ],
+                    'max_tokens': 400, 'temperature': 0.3
+                },
+                timeout=20
+            )
+            if resp.status_code == 200:
+                return resp.json()['choices'][0]['message']['content'].strip()
+            else:
+                logging.warning(f'BANKR LLM error {resp.status_code} — falling back to Grok')
+        except Exception as e:
+            logging.warning(f'BANKR LLM error: {e} — falling back to Grok')
+
+    # Fallback: Grok-3-mini via XAI
     if not XAI_API_KEY:
-        logging.warning('XAI_API_KEY not set — LIL LLM unavailable')
+        logging.warning('No LLM available (BANKR + XAI both unavailable)')
         return None
     try:
         resp = http_requests.post(
             'https://api.x.ai/v1/chat/completions',
-            headers={
-                'Authorization': f'Bearer {XAI_API_KEY}',
-                'Content-Type': 'application/json'
-            },
+            headers={'Authorization': f'Bearer {XAI_API_KEY}', 'Content-Type': 'application/json'},
             json={
                 'model': GROK_MODEL,
                 'messages': [
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_prompt}
                 ],
-                'max_tokens': 400,
-                'temperature': 0.3
+                'max_tokens': 400, 'temperature': 0.3
             },
             timeout=20
         )
