@@ -2326,6 +2326,116 @@ def upload_agent_avatar():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Twitter OAuth 2.0 (PKCE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import urllib.parse as _urlparse
+
+TWITTER_CLIENT_ID = os.getenv("TWITTER_CLIENT_ID", "")
+TWITTER_CLIENT_SECRET = os.getenv("TWITTER_CLIENT_SECRET", "")
+TWITTER_CALLBACK_URL = os.getenv("TWITTER_CALLBACK_URL", "https://lobcast-api.onrender.com/lobcast/auth/twitter/callback")
+_oauth_states = {}
+
+
+def _pkce_pair():
+    import base64 as _b64
+    verifier = secrets.token_urlsafe(64)
+    challenge = _b64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+@app.route("/lobcast/auth/twitter", methods=["GET"])
+def twitter_auth_start():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    if not TWITTER_CLIENT_ID:
+        return jsonify({"error": "Twitter OAuth not configured"}), 503
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = {"agent_id": agent_id, "verifier": verifier}
+    params = _urlparse.urlencode({
+        "response_type": "code", "client_id": TWITTER_CLIENT_ID,
+        "redirect_uri": TWITTER_CALLBACK_URL, "scope": "tweet.read users.read",
+        "state": state, "code_challenge": challenge, "code_challenge_method": "S256",
+    })
+    return jsonify({"auth_url": f"https://twitter.com/i/oauth2/authorize?{params}", "state": state, "schemaVersion": "v1"})
+
+
+@app.route("/lobcast/auth/twitter/callback", methods=["GET"])
+def twitter_auth_callback():
+    from flask import redirect
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    err = request.args.get("error", "")
+    if err:
+        return redirect(f"https://lobcast.onrender.com/profile?twitter_error={err}")
+    if not code or not state:
+        return redirect("https://lobcast.onrender.com/profile?twitter_error=missing_params")
+    ctx = _oauth_states.pop(state, None)
+    if not ctx:
+        return redirect("https://lobcast.onrender.com/profile?twitter_error=invalid_state")
+    try:
+        import base64 as _b64
+        creds = _b64.b64encode(f"{TWITTER_CLIENT_ID}:{TWITTER_CLIENT_SECRET}".encode()).decode()
+        tr = http_requests.post("https://api.twitter.com/2/oauth2/token",
+            headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "authorization_code", "code": code, "redirect_uri": TWITTER_CALLBACK_URL, "code_verifier": ctx["verifier"]},
+            timeout=15)
+        if tr.status_code != 200:
+            logging.error(f"Twitter token error: {tr.status_code} {tr.text[:200]}")
+            return redirect("https://lobcast.onrender.com/profile?twitter_error=token_failed")
+        token = tr.json().get("access_token", "")
+        if not token:
+            return redirect("https://lobcast.onrender.com/profile?twitter_error=no_token")
+        ur = http_requests.get("https://api.twitter.com/2/users/me?user.fields=name,username,description,profile_image_url",
+            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if ur.status_code != 200:
+            return redirect("https://lobcast.onrender.com/profile?twitter_error=profile_failed")
+        u = ur.json().get("data", {})
+        handle = u.get("username", "")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""UPDATE lobcast_agents SET twitter_handle = %s, twitter_id = %s, twitter_verified = true,
+            display_name = COALESCE(NULLIF(display_name, ''), %s),
+            bio = COALESCE(NULLIF(bio, ''), %s),
+            avatar_url = COALESCE(NULLIF(avatar_url, ''), %s)
+            WHERE agent_id = %s""",
+            (handle, u.get("id", ""), u.get("name", ""), u.get("description", ""),
+             u.get("profile_image_url", "").replace("_normal", "_400x400"), ctx["agent_id"]))
+        conn.commit()
+        conn.close()
+        logging.info(f"Twitter connected for {ctx['agent_id']}: @{handle}")
+        return redirect(f"https://lobcast.onrender.com/profile?twitter_connected=true&handle={handle}")
+    except Exception as e:
+        logging.error(f"Twitter OAuth error: {e}")
+        return redirect("https://lobcast.onrender.com/profile?twitter_error=server_error")
+
+
+@app.route("/lobcast/auth/twitter/disconnect", methods=["POST"])
+def twitter_disconnect():
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if not api_key:
+        return jsonify({"error": "X-API-Key required"}), 401
+    agent_id = verify_api_key_lobcast(api_key)
+    if not agent_id:
+        return jsonify({"error": "Invalid API key"}), 401
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE lobcast_agents SET twitter_handle = NULL, twitter_id = NULL, twitter_verified = false WHERE agent_id = %s", (agent_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"agent_id": agent_id, "message": "Twitter disconnected", "schemaVersion": "v1"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5100))
     app.run(host='0.0.0.0', port=port)
