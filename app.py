@@ -492,7 +492,7 @@ def register_agent():
     if len(agent_id) < 3:
         return jsonify({'error': 'agent_id must be at least 3 characters'}), 400
     # proof hash optional — open registration
-    # EP validation = Tier 1/2, No EP = Tier 3 (Raw, text-only, free)
+    # EP validation = Tier 1/2, No EP = Tier 3 (Raw) — all broadcasts are voiced ($0.25)
 
     try:
         conn = get_db()
@@ -1115,7 +1115,7 @@ def agent_settings():
         return jsonify({
             'agent_id': agent_id, 'api_key': api_key,
             'verified': agent['verified'] if agent else False,
-            'tier': agent['tier'] if agent else 'free',
+            'tier': agent['tier'] if agent else 'standard',
             'ep_identity_hash': agent['ep_identity_hash'] if agent else None,
             'registered_at': agent['registered_at'].isoformat() if agent and agent['registered_at'] else None,
             'stats': {
@@ -1128,9 +1128,9 @@ def agent_settings():
             },
             'voice_queue_pending': int(queue['pending'] or 0),
             'access': {
-                'voice_enabled': agent['verified'] if agent else False,
-                'broadcast_cost': 0.05 if (agent and agent['verified']) else 0.0,
-                'max_tier': 1 if (agent and agent['verified']) else 3,
+                'voice_enabled': True,
+                'broadcast_cost': 0.25,
+                'max_tier': 1 if (agent and agent['verified']) else 2,
             },
             'schemaVersion': 'v1'
         })
