@@ -7,7 +7,7 @@ import hashlib
 import secrets
 import logging
 from datetime import datetime, timezone
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import psycopg2
 import psycopg2.extras
 import requests as http_requests
@@ -1248,12 +1248,9 @@ DEFAULT_VOICE_ID = 'pNInz6obpgDQGcFmaJgB'
 
 
 def generate_tts(text, broadcast_id, voice_id=None):
-    """Generate TTS via ElevenLabs Flash model, upload to Supabase Storage."""
+    """Generate TTS via ElevenLabs, store in PostgreSQL with Supabase fallback."""
     if not ELEVENLABS_API_KEY:
         logging.warning("ELEVENLABS_API_KEY not set")
-        return None
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logging.warning("Supabase not configured")
         return None
     try:
         active_voice = voice_id if voice_id and voice_id in APPROVED_VOICES else ELEVENLABS_VOICE_ID
@@ -1280,21 +1277,45 @@ def generate_tts(text, broadcast_id, voice_id=None):
             logging.error(f"ElevenLabs error {resp.status_code}: {resp.text[:200]}")
             return None
         audio_bytes = resp.content
-        audio_filename = f"broadcasts/{broadcast_id}.mp3"
-        upload_resp = http_requests.post(
-            f"{SUPABASE_URL}/storage/v1/object/lobcast-audio/{audio_filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": "audio/mpeg",
-                "x-upsert": "true"
-            },
-            data=audio_bytes,
-            timeout=30
-        )
-        if upload_resp.status_code not in [200, 201]:
-            logging.error(f"Supabase upload error {upload_resp.status_code}: {upload_resp.text[:200]}")
-            return None
-        audio_url = f"{SUPABASE_URL}/storage/v1/object/public/lobcast-audio/{audio_filename}"
+        # Try Supabase first, fall back to PostgreSQL storage
+        audio_url = None
+        if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+            try:
+                audio_filename = f"broadcasts/{broadcast_id}.mp3"
+                upload_resp = http_requests.post(
+                    f"{SUPABASE_URL}/storage/v1/object/lobcast-audio/{audio_filename}",
+                    headers={
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                        "Content-Type": "audio/mpeg",
+                        "x-upsert": "true"
+                    },
+                    data=audio_bytes,
+                    timeout=30
+                )
+                if upload_resp.status_code in [200, 201]:
+                    audio_url = f"{SUPABASE_URL}/storage/v1/object/public/lobcast-audio/{audio_filename}"
+                    logging.info(f"TTS uploaded to Supabase for {broadcast_id}")
+                else:
+                    logging.warning(f"Supabase upload failed ({upload_resp.status_code}), falling back to DB storage")
+            except Exception as sup_err:
+                logging.warning(f"Supabase unavailable ({sup_err}), falling back to DB storage")
+        # Fallback: store audio in PostgreSQL and serve from our own endpoint
+        if not audio_url:
+            try:
+                conn = get_db()
+                cur = conn.cursor()
+                import psycopg2
+                cur.execute(
+                    "UPDATE lobcast_voice_jobs SET audio_data = %s WHERE broadcast_id = %s",
+                    (psycopg2.Binary(audio_bytes), broadcast_id)
+                )
+                conn.commit()
+                conn.close()
+                audio_url = f"https://lobcast-api.onrender.com/lobcast/audio/stream/{broadcast_id}.mp3"
+                logging.info(f"TTS stored in DB for {broadcast_id}: {audio_url}")
+            except Exception as db_err:
+                logging.error(f"DB audio storage failed: {db_err}")
+                return None
         logging.info(f"TTS complete for {broadcast_id}: {audio_url}")
         return audio_url
     except Exception as e:
@@ -1403,6 +1424,27 @@ def get_broadcast_audio(broadcast_id):
             "schemaVersion": "v1"
         })
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lobcast/audio/stream/<broadcast_id>.mp3", methods=["GET"])
+def stream_broadcast_audio(broadcast_id):
+    """Serve audio stored in PostgreSQL for broadcasts where Supabase is unavailable."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT audio_data FROM lobcast_voice_jobs WHERE broadcast_id = %s AND audio_data IS NOT NULL LIMIT 1", (broadcast_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return jsonify({"error": "Audio not found"}), 404
+        audio_bytes = bytes(row[0])
+        return Response(audio_bytes, mimetype='audio/mpeg', headers={
+            'Content-Disposition': f'inline; filename="{broadcast_id}.mp3"',
+            'Cache-Control': 'public, max-age=86400'
+        })
+    except Exception as e:
+        logging.error(f"Audio stream error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
